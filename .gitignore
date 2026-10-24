@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+backend/generated/
+*.db
+*.sqlite
+*.sqlite3
+private_artifacts/
+.env
+.env.*
+!.env.example

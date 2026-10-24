@@ -1,0 +1,359 @@
+.signin-page{
+  min-height:100dvh;
+  display:grid;
+  grid-template-columns:1.05fr .95fr;
+  background:#f8f9f7;
+  color:#232725;
+  font-family:'DM Sans',system-ui,sans-serif
+}
+.signin-art{
+  position:relative;
+  overflow:hidden;
+  min-height:100dvh;
+  padding:35px 6.5vw;
+  background:#171b19;
+  color:#eef1ed;
+  display:flex;
+  flex-direction:column
+}
+.signin-brand{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  font:700 15px Manrope,system-ui,sans-serif;
+  letter-spacing:-.3px
+}
+.signin-mark{
+  display:inline-grid;
+  place-items:center;
+  width:31px;
+  height:31px;
+  border-radius:9px;
+  background:#c8dacd;
+  color:#314539;
+  flex:none
+}
+.signin-copy{
+  position:relative;
+  z-index:1;
+  margin:auto 0;
+  max-width:470px
+}
+.signin-overline,.signin-kicker{
+  font:500 10px 'DM Mono',monospace;
+  letter-spacing:1.2px;
+  color:#9fb5a5
+}
+.signin-copy h1{
+  font:600 clamp(48px,6.5vw,79px)/1.04 Manrope,system-ui,sans-serif;
+  letter-spacing:-3.6px;
+  margin:17px 0
+}
+.signin-copy h1 em{
+  color:#a9c9b4;
+  font-style:normal
+}
+.signin-copy>p{
+  font-size:15px;
+  line-height:1.75;
+  color:#aab3ae;
+  max-width:390px
+}
+.signin-orbit{
+  position:absolute;
+  width:350px;
+  height:350px;
+  left:min(38vw,430px);
+  top:43%;
+  transform:translateY(-50%);
+  opacity:.7
+}
+.orbit-ring{
+  position:absolute;
+  inset:15px;
+  border:1px solid #526258;
+  border-radius:50%;
+  transform:rotate(-28deg) scaleY(.65)
+}
+.ring-b{
+  inset:40px;
+  border-color:#414b44;
+  transform:rotate(44deg) scaleY(.55)
+}
+.orbit-core{
+  position:absolute;
+  left:50%;
+  top:50%;
+  width:88px;
+  height:88px;
+  transform:translate(-50%,-50%);
+  border:1px solid #64776a;
+  border-radius:25px;
+  display:grid;
+  place-items:center;
+  background:#222a25;
+  color:#bed4c4;
+  box-shadow:0 0 60px #a9c9b41c
+}
+.orbit-node{
+  position:absolute;
+  width:11px;
+  height:11px;
+  border-radius:50%;
+  background:#a9c9b4;
+  box-shadow:0 0 18px #a9c9b4
+}
+.node-a{
+  left:21%;
+  top:24%
+}
+.node-b{
+  right:13%;
+  top:52%;
+  width:7px;
+  height:7px
+}
+.node-c{
+  left:32%;
+  bottom:14%;
+  width:6px;
+  height:6px
+}
+.signin-footer{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  color:#929e96;
+  font-size:11px
+}
+.signin-footer svg{
+  color:#a9c9b4
+}
+.signin-form-side{
+  display:grid;
+  place-items:center;
+  padding:40px
+}
+.signin-form{
+  width:min(100%,390px)
+}
+.signin-icon{
+  width:41px;
+  height:41px;
+  border-radius:12px;
+  display:grid;
+  place-items:center;
+  background:#e8efe9;
+  color:#587861;
+  margin-bottom:25px
+}
+.signin-kicker{
+  color:#718b78;
+  margin:0 0 9px
+}
+.signin-form h2{
+  font:650 26px Manrope,system-ui,sans-serif;
+  letter-spacing:-.7px;
+  margin:0
+}
+.signin-description{
+  color:#727a75;
+  font-size:13px;
+  line-height:1.65;
+  margin:10px 0 25px
+}
+.google-button{
+  min-height:44px;
+  display:flex;
+  justify-content:flex-start
+}
+.google-button.disabled{
+  opacity:.6;
+  pointer-events:none
+}
+.signin-config-error,.signin-error{
+  border:1px solid #e7bdb8;
+  background:#fff5f3;
+  color:#8c3730;
+  padding:11px 13px;
+  border-radius:7px;
+  font-size:12px;
+  line-height:1.55
+}
+.signin-config-error code{
+  font-size:11px
+}
+.signin-loading{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  color:#68716c;
+  font-size:12px;
+  margin-top:15px
+}
+.signin-spinner{
+  width:14px;
+  height:14px;
+  border:1.5px solid #d9e1db;
+  border-top-color:#65806c;
+  border-radius:50%;
+  animation:signin-spin .8s linear infinite
+}
+@keyframes signin-spin{
+  to{
+    transform:rotate(360deg)
+  }
+}
+.signin-error{
+  margin-top:12px
+}
+.signin-security{
+  display:flex;
+  align-items:center;
+  gap:7px;
+  color:#748078;
+  font-size:11px;
+  margin-top:24px
+}
+.signin-security svg{
+  color:#65806c
+}
+.signin-legal{
+  border-top:1px solid #e4e8e4;
+  margin-top:23px;
+  padding-top:14px;
+  color:#929a95;
+  font-size:10px;
+  line-height:1.6
+}
+.signin-mobile-brand{
+  display:none
+}
+@media(max-width:760px){
+  .signin-page{
+    grid-template-columns:1fr
+  }
+  .signin-art{
+    display:none
+  }
+  .signin-form-side{
+    min-height:100dvh;
+    padding:30px 24px
+  }
+  .signin-mobile-brand{
+    display:flex;
+    align-items:center;
+    gap:9px;
+    font:700 14px Manrope,system-ui,sans-serif;
+    margin-bottom:65px
+  }
+  .signin-mobile-brand .signin-mark{
+    width:28px;
+    height:28px
+  }
+  .signin-form{
+    margin-top:-30px
+  }
+}
+
+.auth-tabs{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:4px;
+  padding:4px;
+  border:1px solid #e1e6e1;
+  border-radius:9px;
+  background:#f0f3f0;
+  margin:0 0 17px
+}
+.auth-tabs button{
+  border:0;
+  border-radius:6px;
+  background:transparent;
+  padding:9px;
+  color:#727a75;
+  font:600 12px 'DM Sans',system-ui,sans-serif;
+  cursor:pointer
+}
+.auth-tabs button.active{
+  background:#fff;
+  color:#28322b;
+  box-shadow:0 1px 3px #17201a18
+}
+.auth-form{
+  display:grid;
+  gap:12px
+}
+.auth-form label{
+  display:grid;
+  gap:6px;
+  color:#434c46;
+  font-size:11px;
+  font-weight:600
+}
+.auth-form input{
+  width:100%;
+  box-sizing:border-box;
+  border:1px solid #dce2dc;
+  border-radius:7px;
+  background:#fff;
+  padding:11px 12px;
+  color:#252b27;
+  font:400 13px 'DM Sans',system-ui,sans-serif;
+  outline:none
+}
+.auth-form input:focus{
+  border-color:#758f7b;
+  box-shadow:0 0 0 3px #73927a20
+}
+.auth-form label small{
+  font-size:10px;
+  font-weight:400;
+  color:#89918b
+}
+.auth-submit{
+  min-height:42px;
+  border:1px solid #344d3b;
+  border-radius:7px;
+  background:#344d3b;
+  color:#fff;
+  font:600 12px 'DM Sans',system-ui,sans-serif;
+  cursor:pointer;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  gap:8px;
+  margin-top:3px
+}
+.auth-submit:hover:not(:disabled){
+  background:#293e30
+}
+.auth-submit:disabled{
+  opacity:.65;
+  cursor:wait
+}
+.auth-divider{
+  display:flex;
+  align-items:center;
+  gap:11px;
+  margin:17px 0 12px;
+  color:#929a95;
+  font-size:10px
+}
+.auth-divider span{
+  height:1px;
+  background:#e2e6e2;
+  flex:1
+}
+.auth-provider-unavailable{
+  border:1px solid #e3e8e3;
+  border-radius:7px;
+  padding:11px 13px;
+  color:#7c857e;
+  background:#f5f7f5;
+  font-size:11px;
+  line-height:1.5
+}
+.signin-security{
+  margin-top:18px
+}
