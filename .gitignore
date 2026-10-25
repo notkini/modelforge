@@ -12,3 +12,4 @@ private_artifacts/
 .env
 .env.*
 !.env.example
+.kilo/

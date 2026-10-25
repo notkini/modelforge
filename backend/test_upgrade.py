@@ -547,3 +547,28 @@ def test_spec_parent_refine_routes_to_gemini_script(client, monkeypatch):
     assert 'back_support' in seen[-1] and 'retaining_lip' in seen[-1]
     for axis in (80.0, 100.0):
         assert '%.2f' % axis in seen[-1]
+
+
+def test_digest_raises_without_session_secret(monkeypatch):
+    monkeypatch.setenv('SESSION_SECRET', '')
+    from fastapi import HTTPException
+    from .auth import _digest
+    with pytest.raises(HTTPException) as exc:
+        _digest('test-value')
+    assert exc.value.status_code == 503
+
+
+def test_digest_raises_with_weak_session_secret(monkeypatch):
+    monkeypatch.setenv('SESSION_SECRET', 'replace-with-a-long-random-secret')
+    from fastapi import HTTPException
+    from .auth import _digest
+    with pytest.raises(HTTPException) as exc:
+        _digest('test-value')
+    assert exc.value.status_code == 503
+
+
+def test_digest_works_with_valid_session_secret(monkeypatch):
+    monkeypatch.setenv('SESSION_SECRET', 'a-valid-secret-that-is-long-enough-for-testing-12345')
+    from .auth import _digest
+    result = _digest('test-value')
+    assert isinstance(result, str) and len(result) == 64

@@ -134,8 +134,6 @@ def _call_gemini(message: str) -> str:
             model=settings['gemini_model'], contents=message,
             config=types.GenerateContentConfig(temperature=0, max_output_tokens=MAX_OUTPUT_TOKENS,
                                                thinking_config=types.ThinkingConfig(thinking_level='LOW')))
-    except CodegenError:
-        raise
     except Exception as exc:
         raise CodegenError(_gemini_failure_category(exc) or 'request_failed', _gemini_failure_reason(exc)) from None
     text = (getattr(response, 'text', None) or '').strip()
@@ -168,15 +166,9 @@ def _parse_plan(code: str) -> list:
         raise CodegenError('invalid_plan', 'Plan dimensions must all be positive.')
     if any(value > MAX_DIMENSION_MM for value in dimensions):
         raise CodegenError('invalid_plan', 'A plan dimension exceeds the 500 mm limit.')
-    if request_plan_mismatch_guard(dimensions) is False:
-        raise CodegenError('invalid_plan', 'Plan dimensions are degenerate.')
     if not _EXPLANATION_RE.search(code):
         raise CodegenError('missing_explanation', 'The script must include an `# explanation:` comment.')
     return dimensions
-
-
-def request_plan_mismatch_guard(dimensions: list) -> bool:
-    return all(value > 0 for value in dimensions)
 
 
 def _import_brep(brep_path: str):

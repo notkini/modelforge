@@ -56,3 +56,21 @@ export type Conversation={
  updated:number;
  archived?:boolean
 };
+export type VersionSummary={
+ model_id:string;
+ version:number;
+ parent_version_id:string|null;
+ parent_version:number|null;
+ created_at:string;
+ shape_type:string;
+ generation_method:string;
+ provider:string|null;
+ summary:string;
+ script_available:boolean;
+ artifact_available:boolean;
+ step_available:boolean;
+ watertight:boolean;
+ dimensions_mm:number[]|null;
+ vertices:number|null;
+ faces:number|null
+};

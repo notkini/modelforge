@@ -12,14 +12,23 @@ Defense layers:
   CPU-time cap, and kill-on-close so the whole process tree dies even if
   the script spawns children or hangs;
 - a wall-clock timeout in the parent with TerminateJobObject;
+- bounded script size, BREP output size, and job process count;
 - geometry leaves the worker only as a B-rep file written to the exact
   path the parent designated - the worker returns no other artifacts.
 
 Import restrictions alone are not a security boundary; the Job Object is
-the enforcement of last resort. Windows is required. The untrusted script
-is never executed before the parent attaches the worker to the Job Object:
-the child signals readiness with a marker file and waits for a second
-marker file before reading the payload.
+the enforcement of last resort. Attribute traversal is also not a security
+boundary: as verified empirically, generated scripts can reach ``sys``,
+``io``, ``ctypes``, or ``subprocess`` through helper-class ``__globals__``
+maps, so file access and network connections remain possible inside the
+contained process tree. The Job Object bounds CPU, memory, wall time, and
+child-process count; it does not restrict filesystem paths or network
+access. Deploy behind an operating-system boundary and see
+``SANDBOX_SECURITY.md`` before serving untrusted users. Windows is
+required. The untrusted script is never executed before the parent
+attaches the worker to the Job Object: the child signals readiness with a
+marker file and waits for a second marker file before reading the payload.
+Every failure path removes the worker's temporary directory.
 """
 import ctypes
 import ctypes.wintypes as wintypes
@@ -35,11 +44,19 @@ DEFAULT_WALL_TIMEOUT_S = 90.0
 DEFAULT_CPU_SECONDS = 30.0
 MEMORY_LIMIT_BYTES = 1024 * 1024 * 1024
 MAX_SCRIPT_CHARS = 100_000
+MAX_BREP_BYTES = 16 * 1024 * 1024
+ACTIVE_PROCESS_LIMIT = 8
+# Limits are read per run and clamped. Unreadable or out-of-range env values
+# fall back to the tuned defaults: MF_SANDBOX_WALL_TIMEOUT_S (5..600 s),
+# MF_SANDBOX_CPU_SECONDS (1..600 s), MF_SANDBOX_MEMORY_BYTES (128 MiB..8 GiB),
+# MF_MAX_SCRIPT_CHARS (1 000..2 000 000), MF_MAX_BREP_BYTES (4 KiB..512 MiB).
 ALLOWED_IMPORT_ROOTS = ('cadquery', 'math')
 
 PROCESS_SET_QUOTA = 0x0100
 PROCESS_TERMINATE = 0x0001
+JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 0x8
 JOB_OBJECT_LIMIT_PROCESS_MEMORY = 0x100
+JOB_OBJECT_LIMIT_JOB_MEMORY = 0x200
 JOB_OBJECT_LIMIT_JOB_TIME = 0x4
 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
 _JobObjectExtendedLimitInformation = 9
@@ -247,20 +264,37 @@ def available() -> bool:
     return _IS_WINDOWS
 
 
+def _clamped_number(raw: str, default: float, minimum: float, maximum: float) -> float:
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if value != value or value in (float('inf'), float('-inf')):
+        return default
+    return min(max(value, minimum), maximum)
+
+
+def _clamped_int(raw: str, default: int, minimum: int, maximum: int) -> int:
+    return int(_clamped_number(raw, float(default), float(minimum), float(maximum)))
+
+
 def _scrub(text: str, workdir: str) -> str:
     cleaned = str(text)[:500]
     return cleaned.replace(workdir, '<workdir>')
 
 
-def _job(cpu_seconds: float):
+def _job(cpu_seconds: float, memory_bytes: int):
     job = _kernel32.CreateJobObjectW(None, None)
     if not job:
         raise ScriptSandboxError('internal_error', 'Could not create the sandbox job object.', 'CreateJobObjectW failed')
     info = _ExtendedLimitInformation()
     info.BasicLimitInformation.LimitFlags = (
-        JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_JOB_TIME | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+        JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_JOB_MEMORY
+        | JOB_OBJECT_LIMIT_JOB_TIME | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
     info.BasicLimitInformation.PerJobUserTimeLimit = int(cpu_seconds * 1e7)
-    info.ProcessMemoryLimit = MEMORY_LIMIT_BYTES
+    info.BasicLimitInformation.ActiveProcessLimit = ACTIVE_PROCESS_LIMIT
+    info.ProcessMemoryLimit = memory_bytes
+    info.JobMemoryLimit = memory_bytes
     ok = _kernel32.SetInformationJobObject(job, _JobObjectExtendedLimitInformation, ctypes.byref(info),
                                            ctypes.sizeof(info))
     if not ok:
@@ -315,21 +349,48 @@ def _killed_error(proc, cpu_seconds: float, code: str, message: str) -> ScriptSa
     return ScriptSandboxError(code, message)
 
 
-def run_script(script: str, wall_timeout_s: float = DEFAULT_WALL_TIMEOUT_S,
-               cpu_seconds: float = DEFAULT_CPU_SECONDS):
+def run_script(script: str, wall_timeout_s: float = None, cpu_seconds: float = None):
     """Execute the script; return ``(brep_path, workdir)`` on success.
 
     The caller must import/remove the B-rep file and finish the work
-    directory with :func:`cleanup_workdir`.
+    directory with :func:`cleanup_workdir`. Every failure removes the work
+    directory before re-raising.
+
+    Limits: explicit arguments win; otherwise the ``MF_*`` environment
+    overrides apply per run (values are validated and clamped); otherwise
+    the tuned module defaults.
     """
     if not available():
         raise ScriptSandboxError('unsupported_platform', 'The generated script sandbox requires Windows.')
     if not isinstance(script, str) or not script.strip():
         raise ScriptSandboxError('invalid_payload', 'Gemini did not return a readable CadQuery script.')
-    if len(script) > MAX_SCRIPT_CHARS:
+    max_script_chars = _clamped_int(os.environ.get('MF_MAX_SCRIPT_CHARS', ''), MAX_SCRIPT_CHARS, 1_000, 2_000_000)
+    if len(script) > max_script_chars:
         raise ScriptSandboxError('script_too_large', 'The generated script is too large to execute.')
-
+    if wall_timeout_s is None:
+        wall_timeout_s = _clamped_number(os.environ.get('MF_SANDBOX_WALL_TIMEOUT_S', ''), DEFAULT_WALL_TIMEOUT_S, 5.0, 600.0)
+    else:
+        wall_timeout_s = float(wall_timeout_s)
+    if cpu_seconds is None:
+        cpu_seconds = _clamped_number(os.environ.get('MF_SANDBOX_CPU_SECONDS', ''), DEFAULT_CPU_SECONDS, 1.0, 600.0)
+    else:
+        cpu_seconds = float(cpu_seconds)
+    memory_bytes = _clamped_int(os.environ.get('MF_SANDBOX_MEMORY_BYTES', ''), MEMORY_LIMIT_BYTES, 128 * 1024 * 1024, 8 * 1024 * 1024 * 1024)
     workdir = tempfile.mkdtemp(prefix='mf-script-')
+    try:
+        brep_path = _run_in_sandbox(script, workdir, wall_timeout_s, cpu_seconds, memory_bytes)
+        max_brep_bytes = _clamped_int(os.environ.get('MF_MAX_BREP_BYTES', ''), MAX_BREP_BYTES, 256, 512 * 1024 * 1024)
+        size = os.path.getsize(brep_path)
+        if size > max_brep_bytes:
+            raise ScriptSandboxError('output_too_large', 'The sandbox produced a %.1f MB geometry file; the configured limit is %.1f MB.' % (size / 1048576.0, max_brep_bytes / 1048576.0))
+        return brep_path, workdir
+    except BaseException:
+        cleanup_workdir(workdir)
+        raise
+
+
+def _run_in_sandbox(script: str, workdir: str, wall_timeout_s: float, cpu_seconds: float, memory_bytes: int) -> str:
+    """Worker lifecycle. Returns the BREP path only when the sandbox reports success."""
     payload_path = os.path.join(workdir, 'payload.json')
     runner_path = os.path.join(workdir, 'runner.py')
     brep_path = os.path.join(workdir, 'result.brep')
@@ -357,11 +418,15 @@ def run_script(script: str, wall_timeout_s: float = DEFAULT_WALL_TIMEOUT_S,
     job = None
     proc = None
     try:
-        job = _job(cpu_seconds)
-        proc = subprocess.Popen(
-            [sys.executable, '-I', '-E', '-s', runner_path, brep_path, payload_path, ready_path, go_path],
-            cwd=workdir, env=env, creationflags=creationflags,
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        job = _job(cpu_seconds, memory_bytes)
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, '-I', '-E', '-s', runner_path, brep_path, payload_path, ready_path, go_path],
+                cwd=workdir, env=env, creationflags=creationflags,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as exc:
+            raise ScriptSandboxError('startup_failed', 'The sandbox worker could not be started.',
+                                     type(exc).__name__) from None
         if not _assign(job, proc):
             raise _killed_error(proc, cpu_seconds, 'startup_failed',
                                 'The sandbox worker could not be attached to its resource limits.')
@@ -390,11 +455,11 @@ def run_script(script: str, wall_timeout_s: float = DEFAULT_WALL_TIMEOUT_S,
                 status = None
         if status and status.get('ok'):
             if os.path.isfile(brep_path):
-                return brep_path, workdir
+                return brep_path
             status = {'ok': False, 'code': 'no_output', 'message': 'The sandbox reported success but produced no geometry file.', 'detail': ''}
         if status and status.get('ok') is False:
-            code = status.get('code') or 'internal_error'
-            message = status.get('message') or 'The sandboxed script failed.'
+            code = str(status.get('code') or 'internal_error')[:60]
+            message = str(status.get('message') or 'The sandboxed script failed.')[:400]
             raise ScriptSandboxError(code, message, _scrub(status.get('detail') or '', workdir))
         raise _killed_error(proc, cpu_seconds, 'crashed',
                             'The sandbox worker stopped without a diagnosis.')
@@ -408,4 +473,12 @@ def run_script(script: str, wall_timeout_s: float = DEFAULT_WALL_TIMEOUT_S,
 
 
 def cleanup_workdir(workdir: str):
-    shutil.rmtree(workdir, ignore_errors=True)
+    """Remove the work directory. Job-node termination is asynchronous and a
+    dying descendant can still hold the directory as its current working
+    directory, so removal is retried briefly instead of silently skipped."""
+    for delay in (0.0, 0.05, 0.1, 0.2, 0.4, 0.8):
+        if delay:
+            time.sleep(delay)
+        shutil.rmtree(workdir, ignore_errors=True)
+        if not os.path.isdir(workdir):
+            return

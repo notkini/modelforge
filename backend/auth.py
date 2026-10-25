@@ -12,9 +12,19 @@ CSRF_COOKIE='modelforge_csrf'
 NONCE_COOKIE='modelforge_nonce'
 SESSION_DAYS=14
 
+def _require_session_secret() -> None:
+    secret = get_settings()['session_secret']
+    if not secret or len(secret) < 40 or secret.lower().startswith('replace-with-'):
+        raise HTTPException(
+            503,
+            detail={'message': 'Set SESSION_SECRET to a randomly generated value of at least 40 characters before enabling sign-in.'},
+        )
+
+
 def _digest(value: str) -> str:
-    secret=get_settings()['session_secret'] or 'development-only-session-secret-change-me'
-    return hmac.new(secret.encode(),value.encode(),hashlib.sha256).hexdigest()
+    _require_session_secret()
+    secret = get_settings()['session_secret']
+    return hmac.new(secret.encode(), value.encode(), hashlib.sha256).hexdigest()
 
 def hash_password(password: str) -> str:
     salt=secrets.token_bytes(16)

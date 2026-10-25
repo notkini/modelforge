@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 import numpy as np
 import trimesh
@@ -9,6 +10,19 @@ from .schemas import CAD_TOLERANCE_MM, CADComponent, Spec
 
 TESSELLATION_TOLERANCE_MM=0.12
 ANGULAR_TOLERANCE_RAD=0.18
+# Geometry complexity caps; env-overridable per run (values validated/clamped):
+# MF_MAX_CAD_SOLIDS (1..1024), MF_MAX_MESH_VERTICES (12..4_000_000),
+# MF_MAX_MESH_FACES (12..8_000_000). Defaults are far above anything the
+# parametric builders legitimately produce.
+DEFAULT_MAX_SOLID_COUNT=32
+DEFAULT_MAX_MESH_VERTICES=400_000
+DEFAULT_MAX_MESH_FACES=800_000
+
+def _clamped_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value=int(float(os.environ.get(name,'')))
+    except (TypeError,ValueError): return default
+    return min(max(value,minimum),maximum)
 
 class CadKernelUnavailable(RuntimeError): pass
 
@@ -205,6 +219,9 @@ def validate_from_cad_shape(cad_shape,requested,tolerance=CAD_TOLERANCE_MM,shape
         raise ValueError('OpenCASCADE produced an invalid, empty, or zero-volume CAD solid.')
     if shape_type=='assembly' and assembly_mode=='union' and len(solids)!=1:
         raise ValueError('Assembly components in union mode must fuse into a single connected solid; parts that merely touch bounding boxes are not enough. Ensure the components physically contact each other, or request assembly_mode="compound" for separate pieces.')
+    max_solids=_clamped_env_int('MF_MAX_CAD_SOLIDS',DEFAULT_MAX_SOLID_COUNT,1,1024)
+    if len(solids)>max_solids:
+        raise ValueError('The generated model contains %d solids; the configured limit is %d.' % (len(solids),max_solids))
     actual=np.array([box.xlen,box.ylen,box.zlen],dtype=float)
     if not np.isfinite(actual).all() or np.min(actual)<=1e-6: raise ValueError('OpenCASCADE produced degenerate outer bounds.')
     requested=np.array(requested,dtype=float)
@@ -233,6 +250,10 @@ def _validated_mesh_payload(cad_shape,valid,solid_count,volume,actual,requested,
     mesh.remove_unreferenced_vertices()
     mesh.fix_normals()
     if mesh.is_empty or not np.isfinite(mesh.vertices).all(): raise ValueError('CAD tessellation produced an empty or non-finite mesh.')
+    max_vertices=_clamped_env_int('MF_MAX_MESH_VERTICES',DEFAULT_MAX_MESH_VERTICES,1,4_000_000)
+    max_faces=_clamped_env_int('MF_MAX_MESH_FACES',DEFAULT_MAX_MESH_FACES,1,8_000_000)
+    if len(mesh.vertices)>max_vertices or len(mesh.faces)>max_faces:
+        raise ValueError('The generated geometry tessellated to %d vertices and %d faces; the configured limits are %d vertices and %d faces.' % (len(mesh.vertices),len(mesh.faces),max_vertices,max_faces))
     validation={
         'cad_solid_valid':valid,'solid_count':solid_count,'volume_mm3':round(volume,4),
         'dimensions_mm':[round(float(value),4) for value in actual],

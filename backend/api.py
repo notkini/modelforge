@@ -23,7 +23,7 @@ from .geometry import generate_with_kernel
 from .import codegen
 from .cad_geometry import save_step
 from .interpreter import ParseError
-from .nlp import InterpretationResult, UnsupportedGeometry, interpret
+from .nlp import InterpretationResult, UnsupportedGeometry, _GeminiRoutingSignal, interpret
 from .script_runner import ScriptSandboxError
 from .schemas import (ConversationCreate, ConversationPatch, GenerateRequest, InterpretRequest,
                       LocalImportRequest, MessageCreate, ParseRequest, RefineRequest, Spec)
@@ -309,7 +309,7 @@ def _resolve_interpreter(interpreter: Optional[str]) -> str:
         raise HTTPException(422,detail={'message':"Unrecognized interpreter selection: use 'auto', 'gemini', or 'local'."})
     return interpreter
 
-SANDBOX_CODES_503={'timeout','cpu_limit','memory_limit','internal_error','startup_failed','unsupported_platform','script_too_large','invalid_payload'}
+SANDBOX_CODES_503={'timeout','cpu_limit','memory_limit','internal_error','startup_failed','unsupported_platform','script_too_large','output_too_large','invalid_payload'}
 
 def _codegen_http_error(exc: codegen.CodegenError) -> HTTPException:
     status=503 if exc.code in SANDBOX_CODES_503 else 422
@@ -402,7 +402,13 @@ def create_model(payload: GenerateRequest,request: Request,db: Session=Depends(g
     try:
         fallback_reason=None
         if payload.spec is None:
-            result=interpret(payload.prompt,interpreter='local')
+            try:
+                result=interpret(payload.prompt,interpreter=payload.interpreter or 'auto')
+            except _GeminiRoutingSignal:
+                # Auto mode: local parser cannot handle this geometry, route to Gemini.
+                if not get_settings()['gemini_api_key']:
+                    raise HTTPException(422,detail={'message':'This shape isn\'t supported by the local interpreter yet. Configure Gemini or simplify the geometry.'})
+                return _generate_with_gemini_script(db,user,conversation,payload,parent)
             if result.needs_clarification or result.spec is None:
                 raise ParseError(result.clarifying_question or 'Please clarify the requested dimensions or shape.')
             spec=result.spec; provider=result.provider; explanation=result.explanation; fallback_reason=result.fallback_reason
@@ -421,7 +427,6 @@ def _generate_with_gemini_script(db,user,conversation,payload,parent):
     try:
         generation=codegen.build_script(request)
         model,mesh,validation,text=_persist_script_model(db,user,conversation,generation,'generation',payload.prompt,parent)
-        db.commit()
         return {**_model_json(model.id,model.parameters_json,mesh,validation,model.generation_method,model.version,model.parent_version_id),
                 'message':text,'provider':'gemini','interpretation_provider':'gemini',
                 'geometry_generation_method':codegen.SCRIPT_METHOD,'fallback_reason':None,
@@ -503,6 +508,39 @@ def get_model(model_id: str,db: Session=Depends(get_db),user: User=Depends(curre
     mesh=_load_mesh(user,model)
     spec=Spec.model_validate(model.parameters_json) if model.generation_method!=codegen.SCRIPT_METHOD else model.parameters_json
     return _model_json(model.id,spec,mesh,model.validation_json,model.generation_method,model.version,model.parent_version_id)
+
+@router.get('/conversations/{conversation_id}/models')
+def list_model_versions(conversation_id: str,limit: int=Query(50,ge=1,le=200),offset: int=Query(0,ge=0),db: Session=Depends(get_db),user: User=Depends(current_user)):
+    """Version history for one conversation: metadata only, no mesh arrays and
+    no generated script bodies. Newest first. Artifacts are reported, not served."""
+    c=owned_conversation(db,conversation_id,user)
+    base=db.query(GeneratedModel).filter(GeneratedModel.conversation_id==c.id)
+    total=base.count()
+    rows=base.order_by(GeneratedModel.version.desc()).offset(offset).limit(limit).all()
+    version_of={m.id:m.version for m in rows}
+    messages={m.id:(m.text,(m.metadata_json or {}).get('interpretation_provider') or (m.metadata_json or {}).get('provider'))
+              for m in db.query(Message).filter(Message.conversation_id==c.id).all() if m.id}
+    items=[]
+    for m in rows:
+        text,provider=messages.get(m.message_id,('',None))[0:2]
+        try:
+            folder=_artifact_folder(user,m)
+            mesh_ok=(folder/'mesh.npz').is_file(); step_ok=(folder/'model.step').is_file()
+        except HTTPException:
+            mesh_ok=step_ok=False
+        validation=m.validation_json or {}
+        parameters=m.parameters_json or {}
+        items.append({'model_id':m.id,'version':m.version,'parent_version_id':m.parent_version_id,
+                      'parent_version':version_of.get(m.parent_version_id),
+                      'created_at':m.created_at.isoformat(),
+                      'shape_type':m.shape_type,'generation_method':m.generation_method,
+                      'provider':provider,'summary':(text or '')[:400],
+                      'script_available':m.generation_method==codegen.SCRIPT_METHOD and bool(parameters.get('creation_script')),
+                      'artifact_available':bool(m.storage_key) and mesh_ok,'step_available':bool(m.storage_key) and step_ok,
+                      'watertight':bool(validation.get('watertight')),
+                      'dimensions_mm':validation.get('dimensions_mm'),
+                      'vertices':validation.get('vertices'),'faces':validation.get('faces')})
+    return {'items':items,'total':total}
 
 @router.get('/models/{model_id}/export')
 def export_model(model_id: str,format: str,db: Session=Depends(get_db),user: User=Depends(current_user)):
