@@ -230,6 +230,73 @@ def validate_from_cad_shape(cad_shape,requested,tolerance=CAD_TOLERANCE_MM,shape
         raise ValueError('CAD dimensions differ from the request beyond %.2f mm: requested %s mm, actual %s mm.' % (tolerance,requested.round(3).tolist(),actual.round(3).tolist()))
     return _validated_mesh_payload(cad_shape,valid,len(solids),volume,actual,requested,discrepancy,tolerance)
 
+
+def split_compound_components(cad_shape, components, tolerance=CAD_TOLERANCE_MM):
+    """Split a CadQuery Compound into per-component meshes.
+
+    Each solid in the compound is matched to a component declaration by
+    comparing the solid's bounding-box dimensions to the component's declared
+    dimensions, then to position. Solid ordering alone is not treated as
+    semantic identity because BREP import does not preserve solid names.
+
+    Returns a list of (component_id, trimesh.Trimesh) tuples in component
+    declaration order. Raises ValueError if the compound cannot be split or a
+    component cannot be matched to a distinct solid.
+    """
+    try:
+        solids=cad_shape.Solids()
+    except Exception as exc: raise ValueError(f'OpenCASCADE could not enumerate compound solids: {type(exc).__name__}.') from exc
+    if not solids: raise ValueError('Compound contains no solids.')
+    if len(solids)<len(components): raise ValueError(f'Compound has {len(solids)} solids but {len(components)} components were declared.')
+
+    # Build per-solid bounding boxes.
+    solid_boxes=[]
+    for solid in solids:
+        try:
+            box=solid.BoundingBox()
+            dims=[box.xlen,box.ylen,box.zlen]
+            center=[(box.xmin+box.xmax)/2,(box.ymin+box.ymax)/2,(box.zmin+box.zmax)/2]
+            volume=float(solid.Volume())
+        except Exception as exc: raise ValueError(f'OpenCASCADE could not read a compound solid: {type(exc).__name__}.') from exc
+        solid_boxes.append({'dims':dims,'center':center,'volume':volume,'solid':solid})
+
+    def dims_match(solid_dims, comp_dims, tol):
+        return all(abs(solid_dims[i]-comp_dims[i])<=tol for i in range(3))
+
+    assignments=[]
+    used=set()
+    for comp in components:
+        comp_dims=[comp.dimensions_mm.width,comp.dimensions_mm.depth,comp.dimensions_mm.height]
+        comp_center=list(comp.position_mm)
+        best=None; best_score=None
+        for idx,sb in enumerate(solid_boxes):
+            if idx in used: continue
+            if not dims_match(sb['dims'],comp_dims,tolerance*4): continue
+            # Position proximity is a secondary tiebreaker.
+            dist=sum((sb['center'][i]-comp_center[i])**2 for i in range(3))**0.5
+            score=(dist,sb['volume'])
+            if best_score is None or score<best_score:
+                best=idx; best_score=score
+        if best is None: raise ValueError(f'Could not match component "{comp.name}" to a distinct solid in the compound.')
+        used.add(best); assignments.append((comp,best))
+
+    # Build meshes in component declaration order.
+    results=[]
+    for comp,solid_idx in assignments:
+        solid=solid_boxes[solid_idx]['solid']
+        try:
+            points,triangles=solid.tessellate(TESSELLATION_TOLERANCE_MM,ANGULAR_TOLERANCE_RAD)
+        except Exception as exc: raise ValueError(f'Component "{comp.name}" failed to tessellate: {type(exc).__name__}.') from exc
+        vertices=np.asarray([[point.x,point.y,point.z] for point in points],dtype=np.float64)
+        faces=np.asarray(triangles,dtype=np.int64)
+        mesh=trimesh.Trimesh(vertices=vertices,faces=faces,process=True,validate=True)
+        mesh.merge_vertices(digits_vertex=5)
+        mesh.remove_unreferenced_vertices()
+        mesh.fix_normals()
+        if mesh.is_empty or not np.isfinite(mesh.vertices).all(): raise ValueError(f'Component "{comp.name}" produced an empty or non-finite mesh.')
+        results.append((comp,mesh))
+    return results
+
 def validate_script_shape(cad_shape,requested):
     """Validate a Gemini-generated CadQuery result against the requested bounds."""
     return validate_from_cad_shape(cad_shape,requested,tolerance=script_dimension_tolerance(requested))

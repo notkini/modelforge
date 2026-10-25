@@ -289,6 +289,21 @@ class ProfileSection(BaseModel):
     z_mm: float = Field(ge=-250,le=250)
     points_mm: list[tuple[float,float]] = Field(min_length=3,max_length=128)
 
+class ComponentMeta(BaseModel):
+    model_config = ConfigDict(extra='forbid', allow_inf_nan=False)
+    id: str = Field(min_length=1, max_length=80)
+    name: str = Field(min_length=1, max_length=80)
+    dimensions_mm: list[float] = Field(min_length=3, max_length=3)
+    position_mm: list[float] = Field(min_length=3, max_length=3)
+    rotation_deg: list[float] = Field(min_length=3, max_length=3)
+    solid_count: int = Field(default=1, ge=1)
+    volume_mm3: Optional[float] = Field(default=None, gt=0)
+    watertight: Optional[bool] = None
+    vertices: Optional[int] = Field(default=None, ge=0)
+    faces: Optional[int] = Field(default=None, ge=0)
+    mesh_file: str = Field(min_length=1, max_length=120)
+
+
 class Spec(BaseModel):
     model_config = ConfigDict(extra='forbid',allow_inf_nan=False)
     shape_type: Shape

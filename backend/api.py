@@ -1,4 +1,4 @@
-import hashlib, json, logging, secrets, time, uuid
+import hashlib, json, logging, re, secrets, time, uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -21,11 +21,11 @@ from .database import get_db
 from .db_models import AuthNonce, AuthSession, Conversation, GeneratedModel, Message, User, now_utc
 from .geometry import generate_with_kernel
 from .import codegen
-from .cad_geometry import save_step
+from .cad_geometry import save_step, split_compound_components
 from .interpreter import ParseError
 from .nlp import InterpretationResult, UnsupportedGeometry, _GeminiRoutingSignal, interpret
 from .script_runner import ScriptSandboxError
-from .schemas import (ConversationCreate, ConversationPatch, GenerateRequest, InterpretRequest,
+from .schemas import (ComponentMeta, ConversationCreate, ConversationPatch, GenerateRequest, InterpretRequest,
                       LocalImportRequest, MessageCreate, ParseRequest, RefineRequest, Spec)
 
 router=APIRouter(prefix='/api')
@@ -37,6 +37,17 @@ def rate_limit(request: Request, category: str, maximum: int, window: int=60):
     items=_rate_windows[key]
     while items and items[0] < now-window: items.popleft()
     if len(items)>=maximum: raise HTTPException(429,detail={'message':'Too many requests. Please wait a moment and try again.'},headers={'Retry-After':str(window)})
+
+
+def _slugify_component_id(name: str) -> str:
+    """Derive a safe filesystem component ID from a display name.
+
+    Lowercases, replaces runs of non-alphanumeric characters with a single
+    underscore, and trims underscores. Never returns an empty string.
+    """
+    slug=re.sub(r'[^a-z0-9]+','_',name.strip().lower()).strip('_')
+    if not slug: slug='component'
+    return slug[:64]
     items.append(now)
 
 def csrf_cookie(response: Response, value: str):
@@ -269,24 +280,35 @@ def _artifact_folder(user: User, model: GeneratedModel) -> Path:
     if root not in folder.parents: raise HTTPException(404,detail={'message':'Model artifact not found.'})
     return folder
 
-def _save_mesh(user: User, model_id: str, mesh: trimesh.Trimesh, cad_shape=None) -> str:
+def _save_mesh(user: User, model_id: str, mesh: trimesh.Trimesh, cad_shape=None, component_meshes=None) -> str:
     folder=(get_settings()['artifact_dir']/user.id/model_id).resolve()
     folder.mkdir(parents=True,exist_ok=True)
     if get_settings()['artifact_dir'] not in folder.parents: raise ValueError('Invalid private artifact location.')
     np.savez_compressed(folder/'mesh.npz',vertices=mesh.vertices.astype(np.float32),faces=mesh.faces.astype(np.int32))
     if cad_shape is not None: save_step(cad_shape,folder/'model.step')
+    # Save individual component meshes alongside the combined mesh.
+    if component_meshes:
+        for comp_id,comp_mesh in component_meshes:
+            safe_id=_slugify_component_id(comp_id)
+            np.savez_compressed(folder/f'mesh_{safe_id}.npz',vertices=comp_mesh.vertices.astype(np.float32),faces=comp_mesh.faces.astype(np.int32))
     return model_id
 
-def _load_mesh(user: User,model: GeneratedModel) -> trimesh.Trimesh:
+def _load_mesh(user: User,model: GeneratedModel,component_id: Optional[str]=None) -> trimesh.Trimesh:
     folder=_artifact_folder(user,model)
-    path=folder/'mesh.npz'
-    if not model.storage_key or not path.is_file(): raise HTTPException(410,detail={'message':'This imported model has metadata only; its original mesh is not available for preview or export.'})
+    if component_id:
+        safe_id=_slugify_component_id(component_id)
+        path=folder/f'mesh_{safe_id}.npz'
+        if not path.is_file(): raise HTTPException(404,detail={'message':f'Component "{component_id}" artifact not found.'})
+    else:
+        path=folder/'mesh.npz'
+        if not model.storage_key or not path.is_file(): raise HTTPException(410,detail={'message':'This imported model has metadata only; its original mesh is not available for preview or export.'})
     try:
         data=np.load(path,allow_pickle=False)
         mesh=trimesh.Trimesh(vertices=data['vertices'],faces=data['faces'],process=True)
         data.close()
         if len(mesh.vertices)>2_000_000 or len(mesh.faces)>4_000_000: raise ValueError('Stored mesh exceeds limits.')
         return mesh
+    except HTTPException: raise
     except Exception as exc: raise HTTPException(422,detail={'message':'Stored model artifact is invalid.'}) from exc
 
 def _remove_artifact(model: GeneratedModel,user: User):
@@ -296,10 +318,28 @@ def _remove_artifact(model: GeneratedModel,user: User):
             if p.is_file(): p.unlink()
         folder.rmdir()
 
-def _model_json(model_id: str,spec,mesh: trimesh.Trimesh,validation: dict,method: str,version: int,parent: Optional[str],include_mesh=True):
+def _model_json(model_id: str,spec,mesh: trimesh.Trimesh,validation: dict,method: str,version: int,parent: Optional[str],include_mesh=True,user: Optional[User]=None):
     parameters=spec.model_dump() if isinstance(spec,Spec) else dict(spec)
     result={'model_id':model_id,'spec':parameters,'validation':validation,'generation_method':method,'version':version,'parent_version_id':parent}
     if include_mesh: result.update({'vertices':mesh.vertices.tolist(),'faces':mesh.faces.tolist()})
+    # Expose per-component metadata and per-component mesh data when present.
+    components=validation.get('components_detail') if isinstance(validation,dict) else None
+    if components:
+        enriched=[]
+        for comp in components:
+            entry=dict(comp)
+            mesh_file=comp.get('mesh_file')
+            if mesh_file and user is not None:
+                try:
+                    cm=_load_mesh(user, GeneratedModel(id=model_id, storage_key=model_id), component_id=comp.get('id'))
+                    entry['vertices']=cm.vertices.tolist()
+                    entry['faces']=cm.faces.tolist()
+                except Exception:
+                    pass
+            enriched.append(entry)
+        result['components']=enriched
+    elif isinstance(validation.get('components'),list):
+        result['components']=validation['components']
     return result
 
 def _resolve_interpreter(interpreter: Optional[str]) -> str:
@@ -320,9 +360,28 @@ def _create_model(db: Session,user: User,spec: Spec,conversation: Conversation,p
     version=(db.query(func.max(GeneratedModel.version)).filter(GeneratedModel.conversation_id==conversation.id).scalar() or 0)+1
     model_id=str(uuid.uuid4()); method='gaussian_implicit_mesh' if spec.shape_type=='organic' else 'parametric_cad'
     validation['generation_method']=method
+    component_meshes=[]
     if spec.shape_type=='assembly':
         validation['component_count']=len(spec.components)
         validation['components']=[component.name for component in spec.components]
+        # Split compound into per-component meshes when assembly_mode keeps them separate.
+        if spec.assembly_mode=='compound' and cad_shape is not None:
+            try:
+                split=split_compound_components(cad_shape,spec.components)
+                for comp,solid_mesh in split:
+                    comp_id=_slugify_component_id(comp.name)
+                    component_meshes.append((comp_id,solid_mesh))
+                    validation.setdefault('components_detail',[]).append(ComponentMeta(
+                        id=comp_id,name=comp.name,
+                        dimensions_mm=[comp.dimensions_mm.width,comp.dimensions_mm.depth,comp.dimensions_mm.height],
+                        position_mm=list(comp.position_mm),
+                        rotation_deg=list(comp.rotation_deg),
+                        solid_count=1,
+                        mesh_file=f'mesh_{comp_id}.npz',
+                    ).model_dump())
+            except ValueError as exc:
+                # If splitting fails, keep combined mesh only; components_detail stays empty.
+                logger.warning('component split failed for model %s: %s', model_id, exc)
     if spec.object_identity: validation['object_identity']=spec.object_identity
     if spec.intended_use: validation['intended_use']=spec.intended_use
     validation['warnings']=list(spec.design_warnings)
@@ -344,7 +403,7 @@ def _create_model(db: Session,user: User,spec: Spec,conversation: Conversation,p
     db.add(msg); db.flush()
     model=GeneratedModel(id=model_id,owner_id=user.id,conversation_id=conversation.id,message_id=msg.id,parent_version_id=parent.id if parent else None,shape_type=spec.shape_type,generation_method=method,parameters_json=spec.model_dump(),validation_json=validation,version=version,storage_key=model_id)
     db.add(model); conversation.updated_at=now_utc(); db.flush()
-    _save_mesh(user,model_id,mesh,cad_shape); db.commit()
+    _save_mesh(user,model_id,mesh,cad_shape,component_meshes); db.commit()
     return model,mesh,validation,assistant_text
 
 def _persist_script_model(db: Session,user: User,conversation: Conversation,generation: codegen.CodegenResult,provider_label: str,prompt: str,parent: Optional[GeneratedModel]=None):
@@ -374,7 +433,8 @@ def _persist_script_model(db: Session,user: User,conversation: Conversation,gene
                          parameters_json=parameters,validation_json=validation,
                          version=version,storage_key=model_id)
     db.add(model); conversation.updated_at=now_utc(); db.flush()
-    _save_mesh(user,model_id,mesh,generation.cad_shape); db.commit()
+    component_meshes=getattr(generation,'component_meshes',None) or []
+    _save_mesh(user,model_id,mesh,generation.cad_shape,component_meshes); db.commit()
     return model,mesh,validation,assistant_text
 
 @router.post('/parse-prompt')
@@ -415,7 +475,7 @@ def create_model(payload: GenerateRequest,request: Request,db: Session=Depends(g
         else:
             spec=payload.spec; provider='parameter-inspector'; explanation='Generated from validated ModelForge parameters.'
         model,mesh,validation,text=_create_model(db,user,spec,conversation,payload.prompt,provider,explanation,parent,fallback_reason)
-        return {**_model_json(model.id,spec,mesh,validation,model.generation_method,model.version,model.parent_version_id),
+        return {**_model_json(model.id,spec,mesh,validation,model.generation_method,model.version,model.parent_version_id,user=user),
                 'message':text,'provider':provider,'interpretation_provider':provider,
                 'geometry_generation_method':model.generation_method,'fallback_reason':fallback_reason}
     except RuntimeError as exc: db.rollback(); raise HTTPException(503,detail={'message':str(exc)})
@@ -427,7 +487,7 @@ def _generate_with_gemini_script(db,user,conversation,payload,parent):
     try:
         generation=codegen.build_script(request)
         model,mesh,validation,text=_persist_script_model(db,user,conversation,generation,'generation',payload.prompt,parent)
-        return {**_model_json(model.id,model.parameters_json,mesh,validation,model.generation_method,model.version,model.parent_version_id),
+        return {**_model_json(model.id,model.parameters_json,mesh,validation,model.generation_method,model.version,model.parent_version_id,user=user),
                 'message':text,'provider':'gemini','interpretation_provider':'gemini',
                 'geometry_generation_method':codegen.SCRIPT_METHOD,'fallback_reason':None,
                 'script_attempts':generation.attempts}
@@ -458,7 +518,7 @@ def refine_model(model_id: str,payload: RefineRequest,request: Request,db: Sessi
     try:
         model,mesh,validation,text=_create_model(db,user,result.spec,conversation,payload.instruction,result.provider,result.explanation,old,result.fallback_reason)
         db.commit()
-        return {**_model_json(model.id,result.spec,mesh,validation,model.generation_method,model.version,old.id),
+        return {**_model_json(model.id,result.spec,mesh,validation,model.generation_method,model.version,old.id,user=user),
                 'message':text,'provider':result.provider,'interpretation_provider':result.provider,
                 'geometry_generation_method':model.generation_method,'fallback_reason':result.fallback_reason}
     except RuntimeError as exc: db.rollback(); raise HTTPException(503,detail={'message':str(exc)})
@@ -475,13 +535,12 @@ def _refine_script_model(db,user,conversation,old,payload,recent):
         generation=codegen.build_script(request)
         model,mesh,validation,text=_persist_script_model(db,user,conversation,generation,'refinement',payload.instruction,old)
         db.commit()
-        return {**_model_json(model.id,model.parameters_json,mesh,validation,model.generation_method,model.version,old.id),
+        return {**_model_json(model.id,model.parameters_json,mesh,validation,model.generation_method,model.version,old.id,user=user),
                 'message':text,'provider':'gemini','interpretation_provider':'gemini',
                 'geometry_generation_method':codegen.SCRIPT_METHOD,'fallback_reason':None,
                 'script_attempts':generation.attempts}
     except codegen.CodegenError as exc: db.rollback(); raise _codegen_http_error(exc)
     except RuntimeError as exc: db.rollback(); raise HTTPException(503,detail={'message':str(exc)})
-    except (ValueError,UnsupportedGeometry) as exc: db.rollback(); raise HTTPException(422,detail={'message':str(exc)})
 
 def _refine_spec_through_gemini(db,user,conversation,old,payload,recent,old_spec):
     request=codegen.ScriptRequest(prompt=payload.instruction,instruction=payload.instruction,
@@ -493,7 +552,7 @@ def _refine_spec_through_gemini(db,user,conversation,old,payload,recent,old_spec
         generation=codegen.build_script(request)
         model,mesh,validation,text=_persist_script_model(db,user,conversation,generation,'refinement',payload.instruction,old)
         db.commit()
-        return {**_model_json(model.id,model.parameters_json,mesh,validation,model.generation_method,model.version,old.id),
+        return {**_model_json(model.id,model.parameters_json,mesh,validation,model.generation_method,model.version,old.id,user=user),
                 'message':text,'provider':'gemini','interpretation_provider':'gemini',
                 'geometry_generation_method':codegen.SCRIPT_METHOD,'fallback_reason':None,
                 'script_attempts':generation.attempts}
@@ -507,7 +566,7 @@ def get_model(model_id: str,db: Session=Depends(get_db),user: User=Depends(curre
     if not model: raise HTTPException(404,detail={'message':'Model not found.'})
     mesh=_load_mesh(user,model)
     spec=Spec.model_validate(model.parameters_json) if model.generation_method!=codegen.SCRIPT_METHOD else model.parameters_json
-    return _model_json(model.id,spec,mesh,model.validation_json,model.generation_method,model.version,model.parent_version_id)
+    return _model_json(model.id,spec,mesh,model.validation_json,model.generation_method,model.version,model.parent_version_id,user=user)
 
 @router.get('/conversations/{conversation_id}/models')
 def list_model_versions(conversation_id: str,limit: int=Query(50,ge=1,le=200),offset: int=Query(0,ge=0),db: Session=Depends(get_db),user: User=Depends(current_user)):
@@ -543,12 +602,13 @@ def list_model_versions(conversation_id: str,limit: int=Query(50,ge=1,le=200),of
     return {'items':items,'total':total}
 
 @router.get('/models/{model_id}/export')
-def export_model(model_id: str,format: str,db: Session=Depends(get_db),user: User=Depends(current_user)):
+def export_model(model_id: str,format: str,component: Optional[str]=Query(default=None),db: Session=Depends(get_db),user: User=Depends(current_user)):
     model=db.query(GeneratedModel).filter(GeneratedModel.id==model_id,GeneratedModel.owner_id==user.id).first()
     if not model: raise HTTPException(404,detail={'message':'Model not found.'})
     if format not in ('stl','glb'): raise HTTPException(422,detail={'message':'Format must be stl or glb.'})
-    mesh=_load_mesh(user,model)
+    mesh=_load_mesh(user,model,component_id=component)
     try:
         data=mesh.export(file_type=format)
-        return RawResponse(content=data,media_type='model/stl' if format=='stl' else 'model/gltf-binary',headers={'Content-Disposition':f'attachment; filename="modelforge.{format}"'})
+        fname=f'modelforge{("-"+component) if component else ""}.{format}'
+        return RawResponse(content=data,media_type='model/stl' if format=='stl' else 'model/gltf-binary',headers={'Content-Disposition':f'attachment; filename="{fname}"'})
     except Exception as exc: raise HTTPException(422,detail={'message':'Export failed for this mesh.'}) from exc

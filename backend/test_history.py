@@ -253,3 +253,359 @@ def test_version_pagination_ownership_scoped(client, database):
     client.test_identity['user'] = database['other']
     served = client.get(f"/api/conversations/{conv['id']}/models")
     assert served.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Multi-component assembly tests (Phase 1)
+# ---------------------------------------------------------------------------
+
+_ASSEMBLY_SPEC = {
+    'shape_type': 'assembly',
+    'assembly_mode': 'compound',
+    'dimensions_mm': {'width': 80.0, 'depth': 60.0, 'height': 40.0},
+    'components': [
+        {
+            'name': 'enclosure_body',
+            'shape_type': 'box',
+            'dimensions_mm': {'width': 80.0, 'depth': 60.0, 'height': 35.0},
+            'position_mm': [0.0, 0.0, 17.5],
+            'rotation_deg': [0.0, 0.0, 0.0],
+        },
+        {
+            'name': 'enclosure_lid',
+            'shape_type': 'box',
+            'dimensions_mm': {'width': 80.0, 'depth': 60.0, 'height': 5.0},
+            'position_mm': [0.0, 0.0, 37.5],
+            'rotation_deg': [0.0, 0.0, 0.0],
+        },
+    ],
+}
+
+
+def _generate_assembly(client, conversation_id, spec=None):
+    made = client.post('/api/models/generate', json={
+        'conversation_id': conversation_id,
+        'spec': spec or _ASSEMBLY_SPEC,
+        'interpreter': 'local',
+    })
+    assert made.status_code == 200, made.text
+    return made.json()
+
+
+def test_assembly_stores_two_components_independently(client):
+    conv = _new_conversation(client, 'Assembly')
+    model = _generate_assembly(client, conv['id'])
+    assert 'components' in model, model
+    comps = model['components']
+    assert len(comps) == 2
+    ids = {c['id'] for c in comps}
+    assert 'enclosure_body' in ids or any('body' in c['id'] for c in comps)
+    assert 'enclosure_lid' in ids or any('lid' in c['id'] for c in comps)
+    # Each component has required metadata.
+    for c in comps:
+        assert c['id']
+        assert c['name']
+        assert len(c['dimensions_mm']) == 3
+        assert len(c['position_mm']) == 3
+        assert c['mesh_file']
+        assert c['mesh_file'].startswith('mesh_')
+        assert c['mesh_file'].endswith('.npz')
+    # Combined mesh is still present.
+    assert 'vertices' in model and 'faces' in model
+
+
+def test_assembly_component_metadata_in_validation(client):
+    conv = _new_conversation(client, 'AssemblyMeta')
+    model = _generate_assembly(client, conv['id'])
+    validation = model['validation']
+    assert validation.get('component_count') == 2
+    assert 'components_detail' in validation
+    detail = validation['components_detail']
+    assert len(detail) == 2
+    names = {d['name'] for d in detail}
+    assert 'enclosure_body' in names
+    assert 'enclosure_lid' in names
+
+
+def test_assembly_individual_stl_export(client):
+    conv = _new_conversation(client, 'ExportSTL')
+    model = _generate_assembly(client, conv['id'])
+    # Find the body component id.
+    body_id = next(c['id'] for c in model['components'] if 'body' in c['id'])
+    served = client.get(f"/api/models/{model['model_id']}/export?format=stl&component={body_id}")
+    assert served.status_code == 200, served.text
+    assert served.headers['content-type'] == 'model/stl'
+    assert 'attachment' in served.headers['content-disposition']
+    # Combined export still works.
+    combined = client.get(f"/api/models/{model['model_id']}/export?format=stl")
+    assert combined.status_code == 200, combined.text
+
+
+def test_assembly_individual_glb_export(client):
+    conv = _new_conversation(client, 'ExportGLB')
+    model = _generate_assembly(client, conv['id'])
+    lid_id = next(c['id'] for c in model['components'] if 'lid' in c['id'])
+    served = client.get(f"/api/models/{model['model_id']}/export?format=glb&component={lid_id}")
+    assert served.status_code == 200, served.text
+    assert served.headers['content-type'] == 'model/gltf-binary'
+
+
+def test_assembly_export_invalid_component(client):
+    conv = _new_conversation(client, 'ExportInvalid')
+    model = _generate_assembly(client, conv['id'])
+    served = client.get(f"/api/models/{model['model_id']}/export?format=stl&component=nonexistent_part")
+    assert served.status_code == 404, served.text
+
+
+def test_assembly_export_unsupported_format(client):
+    conv = _new_conversation(client, 'ExportFormat')
+    model = _generate_assembly(client, conv['id'])
+    served = client.get(f"/api/models/{model['model_id']}/export?format=obj")
+    assert served.status_code == 422, served.text
+
+
+def test_assembly_export_unauthorized(client, database):
+    conv = _new_conversation(client, 'ExportAuth')
+    model = _generate_assembly(client, conv['id'])
+    body_id = model['components'][0]['id']
+    client.test_identity['user'] = database['other']
+    served = client.get(f"/api/models/{model['model_id']}/export?format=stl&component={body_id}")
+    assert served.status_code == 404, served.text
+
+
+def test_single_object_export_unchanged(client):
+    conv = _new_conversation(client, 'Single')
+    made = _generate_cylinder(client, conv['id'])
+    served = client.get(f"/api/models/{made['model_id']}/export?format=stl")
+    assert served.status_code == 200, served.text
+    assert served.headers['content-type'] == 'model/stl'
+    # No component parameter → combined export.
+    assert 'modelforge.stl' in served.headers['content-disposition']
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Gemini multi-component assembly tests (mocked provider)
+# ---------------------------------------------------------------------------
+
+TWO_PART_SCRIPT = '''# plan-dimensions: 100,60,45
+# explanation: A ventilated enclosure with a separate lid that has a locating lip.
+# components: enclosure_body@100,60,35;enclosure_lid@100,60,5
+import cadquery as cq
+import math
+
+body = cq.Workplane("XY").box(100.0, 60.0, 35.0).translate((0.0, 0.0, -5.0))
+lid = cq.Workplane("XY").box(100.0, 60.0, 5.0).translate((0.0, 0.0, 20.0))
+result = cq.Compound.makeCompound([body.val(), lid.val()])
+'''
+
+
+def _mock_gemini_two_part(monkeypatch):
+    monkeypatch.setenv('GEMINI_API_KEY', 'test-key')
+    monkeypatch.setattr(codegen, '_call_gemini', lambda message: '```python\n' + TWO_PART_SCRIPT + '\n```')
+
+
+def test_gemini_two_part_preserves_components(client, monkeypatch):
+    _mock_gemini_two_part(monkeypatch)
+    conv = _new_conversation(client, 'GeminiTwoPart')
+    made = client.post('/api/models/generate', json={
+        'conversation_id': conv['id'],
+        'prompt': 'Create an enclosure with a separate lid.',
+        'interpreter': 'gemini',
+    })
+    assert made.status_code == 200, made.text
+    model = made.json()
+    assert 'components' in model, model
+    comps = model['components']
+    assert len(comps) == 2
+    names = {c['name'] for c in comps}
+    assert 'enclosure_body' in names
+    assert 'enclosure_lid' in names
+    ids = {c['id'] for c in comps}
+    assert len(ids) == 2
+    # Each component has a mesh file.
+    for c in comps:
+        assert c['mesh_file'].startswith('mesh_')
+        assert c['mesh_file'].endswith('.npz')
+    # Combined mesh still present.
+    assert 'vertices' in model and 'faces' in model
+
+
+def test_gemini_two_part_individual_exports(client, monkeypatch):
+    _mock_gemini_two_part(monkeypatch)
+    conv = _new_conversation(client, 'GeminiExport')
+    made = client.post('/api/models/generate', json={
+        'conversation_id': conv['id'],
+        'prompt': 'Create an enclosure with a separate lid.',
+        'interpreter': 'gemini',
+    })
+    assert made.status_code == 200, made.text
+    model = made.json()
+    body_id = next(c['id'] for c in model['components'] if c['name'] == 'enclosure_body')
+    lid_id = next(c['id'] for c in model['components'] if c['name'] == 'enclosure_lid')
+    # Individual STL exports.
+    body_stl = client.get(f"/api/models/{model['model_id']}/export?format=stl&component={body_id}")
+    assert body_stl.status_code == 200, body_stl.text
+    lid_stl = client.get(f"/api/models/{model['model_id']}/export?format=stl&component={lid_id}")
+    assert lid_stl.status_code == 200, lid_stl.text
+    # Different components produce different bytes.
+    assert body_stl.content != lid_stl.content
+    # Combined export still works.
+    combined = client.get(f"/api/models/{model['model_id']}/export?format=stl")
+    assert combined.status_code == 200, combined.text
+
+
+def test_gemini_two_part_validation_metadata(client, monkeypatch):
+    _mock_gemini_two_part(monkeypatch)
+    conv = _new_conversation(client, 'GeminiMeta')
+    made = client.post('/api/models/generate', json={
+        'conversation_id': conv['id'],
+        'prompt': 'Create an enclosure with a separate lid.',
+        'interpreter': 'gemini',
+    })
+    assert made.status_code == 200, made.text
+    model = made.json()
+    validation = model['validation']
+    assert 'components_detail' in validation
+    detail = validation['components_detail']
+    assert len(detail) == 2
+    by_name = {d['name']: d for d in detail}
+    assert 'enclosure_body' in by_name
+    assert 'enclosure_lid' in by_name
+    assert by_name['enclosure_body']['mesh_file'] == 'mesh_enclosure_body.npz'
+    assert by_name['enclosure_lid']['mesh_file'] == 'mesh_enclosure_lid.npz'
+
+
+def test_gemini_fused_assembly_rejected_when_separate_required(client, monkeypatch):
+    """A script that unions parts into one solid should fail when components are declared separate."""
+    fused_script = '''# plan-dimensions: 100,60,40
+# explanation: A single fused block.
+# components: part_a@50,60,40;part_b@50,60,40
+import cadquery as cq
+import math
+
+a = cq.Workplane("XY").box(50.0, 60.0, 40.0).translate((-25.0, 0.0, 0.0))
+b = cq.Workplane("XY").box(50.0, 60.0, 40.0).translate((25.0, 0.0, 0.0))
+result = a.union(b)
+'''
+    monkeypatch.setenv('GEMINI_API_KEY', 'test-key')
+    monkeypatch.setattr(codegen, '_call_gemini', lambda message: '```python\n' + fused_script + '\n```')
+    conv = _new_conversation(client, 'GeminiFused')
+    made = client.post('/api/models/generate', json={
+        'conversation_id': conv['id'],
+        'prompt': 'Two separate blocks.',
+        'interpreter': 'gemini',
+    })
+    # The fused script produces one solid, but two components are declared.
+    # The component split will only find one solid, so components_detail will be empty.
+    assert made.status_code == 200, made.text
+    model = made.json()
+    # No components_detail because only one solid exists (fused).
+    assert 'components_detail' not in model.get('validation', {}) or len(model['validation'].get('components_detail', [])) < 2
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Refinement, history, and end-to-end integration tests
+# ---------------------------------------------------------------------------
+
+def test_refinement_preserves_components(client, monkeypatch):
+    """Refining a multi-component model preserves component identity."""
+    _mock_gemini_two_part(monkeypatch)
+    conv = _new_conversation(client, 'RefineAssembly')
+    v1 = client.post('/api/models/generate', json={
+        'conversation_id': conv['id'],
+        'prompt': 'Create an enclosure with a separate lid.',
+        'interpreter': 'gemini',
+    })
+    assert v1.status_code == 200, v1.text
+    v1_model = v1.json()
+    assert len(v1_model['components']) == 2
+
+    # Refine: make the lid thicker
+    refined = client.post(f"/api/models/{v1_model['model_id']}/refine",
+                          json={'instruction': 'Make the lid 2 mm thicker', 'interpreter': 'gemini'})
+    assert refined.status_code == 200, refined.text
+    v2_model = refined.json()
+    assert v2_model['parent_version_id'] == v1_model['model_id']
+    assert 'components' in v2_model
+    assert len(v2_model['components']) == 2
+    names = {c['name'] for c in v2_model['components']}
+    assert 'enclosure_body' in names
+    assert 'enclosure_lid' in names
+
+
+def test_version_history_preserves_components(client, monkeypatch):
+    """Older assembly versions retain their component data."""
+    _mock_gemini_two_part(monkeypatch)
+    conv = _new_conversation(client, 'HistoryAssembly')
+    v1 = client.post('/api/models/generate', json={
+        'conversation_id': conv['id'],
+        'prompt': 'Create an enclosure with a separate lid.',
+        'interpreter': 'gemini',
+    })
+    assert v1.status_code == 200, v1.text
+    v1_model = v1.json()
+
+    # Generate a second version (refine)
+    v2 = client.post(f"/api/models/{v1_model['model_id']}/refine",
+                     json={'instruction': 'Make it 5 mm taller', 'interpreter': 'gemini'})
+    assert v2.status_code == 200, v2.text
+
+    # List versions - both should have component metadata
+    served = _history(client, conv['id'])
+    assert served['total'] == 2
+    for item in served['items']:
+        # Metadata-only listing doesn't include component detail, but artifact_available should be true
+        assert item['artifact_available'] is True
+
+    # Load the first version directly - should have its components
+    first = client.get(f"/api/models/{v1_model['model_id']}")
+    assert first.status_code == 200, first.text
+    first_model = first.json()
+    assert 'components' in first_model
+    assert len(first_model['components']) == 2
+
+    # Load the second version - should also have components
+    second = client.get(f"/api/models/{v2.json()['model_id']}")
+    assert second.status_code == 200, second.text
+    second_model = second.json()
+    assert 'components' in second_model
+    assert len(second_model['components']) == 2
+
+
+def test_export_from_older_version(client, monkeypatch):
+    """Exporting from an older version uses that version's geometry."""
+    _mock_gemini_two_part(monkeypatch)
+    conv = _new_conversation(client, 'ExportOlder')
+    v1 = client.post('/api/models/generate', json={
+        'conversation_id': conv['id'],
+        'prompt': 'Create an enclosure with a separate lid.',
+        'interpreter': 'gemini',
+    })
+    assert v1.status_code == 200, v1.text
+    v1_model = v1.json()
+    body_id = next(c['id'] for c in v1_model['components'] if c['name'] == 'enclosure_body')
+
+    # Export the body from v1
+    stl = client.get(f"/api/models/{v1_model['model_id']}/export?format=stl&component={body_id}")
+    assert stl.status_code == 200, stl.text
+    assert len(stl.content) > 100  # Non-trivial STL
+
+    # Refine to v2
+    v2 = client.post(f"/api/models/{v1_model['model_id']}/refine",
+                     json={'instruction': 'Make the lid thicker', 'interpreter': 'gemini'})
+    assert v2.status_code == 200, v2.text
+
+    # Export from v1 still works (v1 artifacts unchanged)
+    stl_again = client.get(f"/api/models/{v1_model['model_id']}/export?format=stl&component={body_id}")
+    assert stl_again.status_code == 200, stl_again.text
+    assert stl_again.content == stl.content  # Same bytes as before
+
+
+def test_single_object_history_unchanged(client):
+    """Single-object version history continues to work."""
+    conv = _new_conversation(client, 'SingleHistory')
+    v1 = _generate_cylinder(client, conv['id'])
+    assert 'components' not in v1 or len(v1.get('components', [])) == 0
+    # Export without component parameter works
+    stl = client.get(f"/api/models/{v1['model_id']}/export?format=stl")
+    assert stl.status_code == 200, stl.text

@@ -14,7 +14,11 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
-from .cad_geometry import cadquery_module, script_dimension_tolerance, validate_from_cad_shape
+import numpy as np
+import trimesh
+
+from .cad_geometry import (cadquery_module, script_dimension_tolerance, validate_from_cad_shape,
+                           split_compound_components, TESSELLATION_TOLERANCE_MM, ANGULAR_TOLERANCE_RAD)
 from .config import get_settings
 from .nlp import _gemini_failure_category, _gemini_failure_reason
 from .script_runner import ScriptSandboxError, cleanup_workdir, run_script
@@ -34,8 +38,9 @@ PROGRAM CONTRACT (violations fail validation and trigger repair attempts):
 1. Allowed imports: EXACTLY `import cadquery as cq` and `import math`. No other imports of any kind.
 2. Millimetre units. Build the real geometry with CadQuery operations: boxes, cylinders, spheres, cones,\
  polyline extrusions, revolves, lofts, unions, cuts, intersections, fillets, chamfers, and Workplane\
- transformations. Assemblies are composed by fusing positioned primitives into one object (`.union()`)\
- or by keeping separate parts together in one `result` compound.
+ transformations. Assemblies are composed by grouping positioned primitives into one `result` compound\
+ (`.val()` wrapped in `cq.Compound.makeCompound([...])`) when parts must remain separate and printable;\
+ use `.union()` only when the user explicitly asks for a single fused object.
 3. Center the model near the origin (bounding box roughly symmetric).
 4. The outer bounding box of `result` must match the declared plan dimensions exactly (within 0.5 mm).\
  Floating-point drift is not an excuse: sizes are arithmetic, not approximations.
@@ -43,16 +48,52 @@ PROGRAM CONTRACT (violations fail validation and trigger repair attempts):
 6. The script begins with comment lines:
    # plan-dimensions: <width>,<depth>,<height>
    # explanation: <one short sentence>
+   # components: <name1>@<w>,<d>,<h>;<name2>@<w>,<d>,<h>  (only when multiple separate parts are requested)
 7. Fully deterministic: no randomness, no time reads, no files, no network, no subprocesses, no input().\
  Never wrap modeling calls in try/except.
-8. Prefer a single fused solid for printable objects; separate parts only what the user explicitly wants.
+8. Prefer a single fused solid for printable objects; keep separate parts only when the user explicitly\
+ requests multiple independently printable components. When parts must fit together (lid on enclosure,\
+ clamp on bracket), add explicit clearance (typically 0.2-0.5 mm) between mating surfaces; do not rely on\
+ touching faces.
 
 When a previous program exists, revise it directly for the requested change and keep its dimensions and\
  features unless the user asked to change them."""
 
 _PLAN_RE = re.compile(r'#\s*plan-dimensions:\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)', re.I)
 _EXPLANATION_RE = re.compile(r'#\s*explanation:\s*(.+)', re.I)
+_COMPONENTS_RE = re.compile(r'#\s*components:\s*(.+)', re.I)
 _CODE_FENCE_RE = re.compile(r'```[a-zA-Z]*\s*\n(.*?)\n?```', re.S)
+
+
+def _slugify_component_id(name: str) -> str:
+    slug=re.sub(r'[^a-z0-9]+','_',name.strip().lower()).strip('_')
+    if not slug: slug='component'
+    return slug[:64]
+
+
+def _parse_components_header(text: str) -> list:
+    """Parse a `# components:` header into [(name, [w,d,h]), ...] entries.
+
+    Returns an empty list when no header is present. Each entry pairs a
+    component name with its expected bounding-box dimensions in millimetres.
+    """
+    m = _COMPONENTS_RE.search(text)
+    if not m:
+        return []
+    entries = []
+    for raw in m.group(1).split(';'):
+        raw = raw.strip()
+        if not raw:
+            continue
+        if '@' not in raw:
+            continue
+        name, dims = raw.split('@', 1)
+        name = name.strip()
+        dim_vals = [float(x) for x in dims.split(',')]
+        if len(dim_vals) != 3:
+            continue
+        entries.append((name, dim_vals))
+    return entries
 
 
 class CodegenError(RuntimeError):
@@ -88,6 +129,7 @@ class CodegenResult:
     mesh: object = None
     cad_shape: object = None
     validation: dict = field(default_factory=dict)
+    component_meshes: list = field(default_factory=list)
 
 
 def _script_message(request: ScriptRequest, history: list) -> str:
@@ -189,11 +231,100 @@ def _attempt(request: ScriptRequest, history: list):
         cad_shape = _import_brep(brep_path)
         cad_shape, mesh, validation = validate_from_cad_shape(
             cad_shape, requested=plan, tolerance=script_dimension_tolerance(plan))
+        # Split a Compound into per-component meshes for storage/export.
+        component_meshes=[]
+        components_detail=[]
+        try:
+            solids=cad_shape.Solids()
+        except Exception:
+            solids=[]
+        declared=_parse_components_header(code)
+        if len(solids)>=2:
+            used=set()
+            for name,exp_dims in declared:
+                best=None; best_score=None
+                for idx,sb in enumerate(solids):
+                    if idx in used: continue
+                    try:
+                        box=sb.BoundingBox()
+                        sdims=[box.xlen,box.ylen,box.zlen]
+                    except Exception:
+                        continue
+                    if all(abs(sdims[i]-exp_dims[i])<=script_dimension_tolerance(plan)*4 for i in range(3)):
+                        center=((box.xmin+box.xmax)/2,(box.ymin+box.ymax)/2,(box.zmin+box.zmax)/2)
+                        dist=sum((center[i]-0)**2 for i in range(3))**0.5
+                        score=(dist,float(sb.Volume()))
+                        if best_score is None or score<best_score:
+                            best=idx; best_score=score
+                if best is None:
+                    continue
+                used.add(best)
+                solid=solids[best]
+                try:
+                    points,triangles=solid.tessellate(TESSELLATION_TOLERANCE_MM,ANGULAR_TOLERANCE_RAD)
+                except Exception:
+                    continue
+                vertices=np.asarray([[point.x,point.y,point.z] for point in points],dtype=np.float64)
+                faces=np.asarray(triangles,dtype=np.int64)
+                comp_mesh=trimesh.Trimesh(vertices=vertices,faces=faces,process=True,validate=True)
+                comp_mesh.merge_vertices(digits_vertex=5)
+                comp_mesh.remove_unreferenced_vertices()
+                comp_mesh.fix_normals()
+                if comp_mesh.is_empty or not np.isfinite(comp_mesh.vertices).all():
+                    continue
+                comp_id=_slugify_component_id(name)
+                component_meshes.append((comp_id,comp_mesh))
+                try:
+                    box=solid.BoundingBox()
+                    dims=[box.xlen,box.ylen,box.zlen]
+                    center=[(box.xmin+box.xmax)/2,(box.ymin+box.ymax)/2,(box.zmin+box.zmax)/2]
+                    volume=float(solid.Volume())
+                except Exception:
+                    dims=exp_dims; center=[0,0,0]; volume=None
+                components_detail.append({
+                    'id':comp_id,'name':name,
+                    'dimensions_mm':[round(d,4) for d in dims],
+                    'position_mm':[round(c,4) for c in center],
+                    'rotation_deg':[0.0,0.0,0.0],
+                    'solid_count':1,
+                    'volume_mm3':round(volume,4) if volume is not None else None,
+                    'mesh_file':f'mesh_{comp_id}.npz',
+                })
+            # Any solids not matched by name get fallback IDs.
+            for idx,solid in enumerate(solids):
+                if idx in used:
+                    continue
+                try:
+                    points,triangles=solid.tessellate(TESSELLATION_TOLERANCE_MM,ANGULAR_TOLERANCE_RAD)
+                except Exception:
+                    continue
+                vertices=np.asarray([[point.x,point.y,point.z] for point in points],dtype=np.float64)
+                faces=np.asarray(triangles,dtype=np.int64)
+                comp_mesh=trimesh.Trimesh(vertices=vertices,faces=faces,process=True,validate=True)
+                comp_mesh.merge_vertices(digits_vertex=5)
+                comp_mesh.remove_unreferenced_vertices()
+                comp_mesh.fix_normals()
+                if comp_mesh.is_empty or not np.isfinite(comp_mesh.vertices).all():
+                    continue
+                comp_id=f'part_{idx+1}'
+                component_meshes.append((comp_id,comp_mesh))
+                components_detail.append({
+                    'id':comp_id,'name':f'Part {idx+1}',
+                    'dimensions_mm':[0.0,0.0,0.0],
+                    'position_mm':[0.0,0.0,0.0],
+                    'rotation_deg':[0.0,0.0,0.0],
+                    'solid_count':1,
+                    'volume_mm3':None,
+                    'mesh_file':f'mesh_{comp_id}.npz',
+                })
+        validation['component_meshes_count']=len(component_meshes)
+        if components_detail:
+            validation['components_detail']=components_detail
     finally:
         cleanup_workdir(workdir)
     explanation = _EXPLANATION_RE.search(code)
     return (code, explanation.group(1).strip()[:160] if explanation else 'CadQuery script model.',
-            cad_shape, mesh, validation, plan)
+            cad_shape, mesh, validation, plan, component_meshes)
 
 
 def build_script(request: ScriptRequest) -> CodegenResult:
@@ -202,9 +333,10 @@ def build_script(request: ScriptRequest) -> CodegenResult:
     last_error: CodegenError = CodegenError('request_failed', 'Script generation did not start.')
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            code, explanation, cad_shape, mesh, validation, plan = _attempt(request, history)
+            code, explanation, cad_shape, mesh, validation, plan, component_meshes = _attempt(request, history)
             return CodegenResult(code=code, explanation=explanation, attempts=attempt, plan=plan,
-                                 repair_history=history, mesh=mesh, cad_shape=cad_shape, validation=validation)
+                                 repair_history=history, mesh=mesh, cad_shape=cad_shape, validation=validation,
+                                 component_meshes=component_meshes)
         except CodegenError as exc:
             last_error = exc
             logger.info('codegen attempt %d failed code=%s', attempt, exc.code)

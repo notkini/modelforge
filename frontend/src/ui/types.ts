@@ -16,31 +16,45 @@ export type Spec={
  resolution:number;
  [key:string]:unknown
 };
-export type Model={
- model_id:string;
- spec:Spec;
- vertices?:number[][];
- faces?:number[][];
- validation:{
-  watertight:boolean;
-  winding_consistent:boolean;
-  vertices:number;
-  faces:number;
+export type ComponentMeta={
+  id:string;
+  name:string;
   dimensions_mm:number[];
-  printability:string;
-  warnings?:string[];
-  components?:string[];
-  component_count?:number;
-  [key:string]:unknown
- };
- generation_method:string;
- version?:number;
- parent_version_id?:string|null;
- provider?:string;
- interpretation_provider?:string;
- geometry_generation_method?:string;
- fallback_reason?:string|null;
- message?:string
+  position_mm:number[];
+  rotation_deg:number[];
+  solid_count:number;
+  volume_mm3?:number|null;
+  watertight?:boolean|null;
+  vertices?:number[][];
+  faces?:number[][];
+  mesh_file:string;
+};
+export type Model={
+  model_id:string;
+  spec:Spec;
+  vertices?:number[][];
+  faces?:number[][];
+  components?:ComponentMeta[];
+  validation:{
+   watertight:boolean;
+   winding_consistent:boolean;
+   vertices:number;
+   faces:number;
+   dimensions_mm:number[];
+   printability:string;
+   warnings?:string[];
+   components?:string[];
+   component_count?:number;
+   [key:string]:unknown
+  };
+  generation_method:string;
+  version?:number;
+  parent_version_id?:string|null;
+  provider?:string;
+  interpretation_provider?:string;
+  geometry_generation_method?:string;
+  fallback_reason?:string|null;
+  message?:string
 };
 export type Message={
  id?:string;
