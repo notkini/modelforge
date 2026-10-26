@@ -13,3 +13,4 @@ private_artifacts/
 .env.*
 !.env.example
 .kilo/
+MODELFORGE_BACKEND_REFERENCE.md
