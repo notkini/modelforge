@@ -14,3 +14,4 @@ private_artifacts/
 !.env.example
 .kilo/
 MODELFORGE_BACKEND_REFERENCE.md
+FEATURES.md
