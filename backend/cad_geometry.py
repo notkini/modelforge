@@ -4,6 +4,7 @@ from __future__ import annotations
 import math
 import os
 from pathlib import Path
+from typing import Optional
 import numpy as np
 import trimesh
 from .schemas import CAD_TOLERANCE_MM, CADComponent, Spec
@@ -186,7 +187,7 @@ def _base_shape(cq,spec:Spec):
     else: raise ValueError(f'Unsupported CAD shape: {s}.')
     return shape
 
-def generate_cad(spec:Spec):
+def generate_cad(spec:Spec,requested_clearance_mm:Optional[float]=None):
     cq=cadquery_module()
     shape=_base_shape(cq,spec)
     shape=_cut_holes(shape,cq,spec)
@@ -202,12 +203,18 @@ def generate_cad(spec:Spec):
     return validate_from_cad_shape(shape.val() if isinstance(shape,cq.Workplane) else shape,
         requested=[spec.dimensions_mm.width,spec.dimensions_mm.depth,spec.dimensions_mm.height],
         tolerance=CAD_TOLERANCE_MM,shape_type=spec.shape_type,
-        assembly_mode=spec.assembly_mode if spec.shape_type=='assembly' else None)
+        assembly_mode=spec.assembly_mode if spec.shape_type=='assembly' else None,
+        components=spec.components if spec.shape_type=='assembly' else None,
+        requested_clearance_mm=requested_clearance_mm)
 
-def validate_from_cad_shape(cad_shape,requested,tolerance=CAD_TOLERANCE_MM,shape_type=None,assembly_mode=None):
+def validate_from_cad_shape(cad_shape,requested,tolerance=CAD_TOLERANCE_MM,shape_type=None,assembly_mode=None,components=None,requested_clearance_mm=None):
     """Validate a CadQuery/OCCT object, tessellate it, and build the validation payload.
 
     Shared by the parametric kernel and by the Gemini CadQuery-script path.
+    When shape_type is 'assembly' and assembly_mode is 'compound', component
+    clearance/interference pairs are appended to the validation payload under
+    the 'component_pairs' key. Single-object and union-mode models are
+    unaffected.
     """
     try:
         valid=bool(cad_shape.isValid())
@@ -228,7 +235,10 @@ def validate_from_cad_shape(cad_shape,requested,tolerance=CAD_TOLERANCE_MM,shape
     discrepancy=np.abs(actual-requested)
     if np.any(discrepancy>tolerance):
         raise ValueError('CAD dimensions differ from the request beyond %.2f mm: requested %s mm, actual %s mm.' % (tolerance,requested.round(3).tolist(),actual.round(3).tolist()))
-    return _validated_mesh_payload(cad_shape,valid,len(solids),volume,actual,requested,discrepancy,tolerance)
+    cad_shape,mesh,validation=_validated_mesh_payload(cad_shape,valid,len(solids),volume,actual,requested,discrepancy,tolerance)
+    if shape_type=='assembly' and assembly_mode=='compound' and components:
+        validation['component_pairs']=check_component_pairs(cad_shape,components,requested_clearance_mm)
+    return cad_shape,mesh,validation
 
 
 def split_compound_components(cad_shape, components, tolerance=CAD_TOLERANCE_MM):
@@ -239,9 +249,9 @@ def split_compound_components(cad_shape, components, tolerance=CAD_TOLERANCE_MM)
     dimensions, then to position. Solid ordering alone is not treated as
     semantic identity because BREP import does not preserve solid names.
 
-    Returns a list of (component_id, trimesh.Trimesh) tuples in component
-    declaration order. Raises ValueError if the compound cannot be split or a
-    component cannot be matched to a distinct solid.
+    Returns a list of (component_id, trimesh.Trimesh, CadQuery solid) tuples in
+    component declaration order. Raises ValueError if the compound cannot be
+    split or a component cannot be matched to a distinct solid.
     """
     try:
         solids=cad_shape.Solids()
@@ -294,7 +304,7 @@ def split_compound_components(cad_shape, components, tolerance=CAD_TOLERANCE_MM)
         mesh.remove_unreferenced_vertices()
         mesh.fix_normals()
         if mesh.is_empty or not np.isfinite(mesh.vertices).all(): raise ValueError(f'Component "{comp.name}" produced an empty or non-finite mesh.')
-        results.append((comp,mesh))
+        results.append((comp, mesh, solid))
     return results
 
 def validate_script_shape(cad_shape,requested):
@@ -337,3 +347,212 @@ def _validated_mesh_payload(cad_shape,valid,solid_count,volume,actual,requested,
 def save_step(shape,path:Path):
     cq=cadquery_module()
     cq.exporters.export(shape,str(path),exportType='STEP')
+
+
+def _slugify_component_id(name: str) -> str:
+    """Derive a safe filesystem/component ID from a display name."""
+    import re
+    slug = re.sub(r'[^a-z0-9]+', '_', name.strip().lower()).strip('_')
+    if not slug:
+        slug = 'component'
+    return slug[:64]
+
+
+def check_component_pairs(cad_shape, components, requested_clearance_mm=None):
+    """Check spatial relationships between all pairs of components in an assembly.
+
+    Broad phase uses rotated AABB overlap. Narrow phase uses OpenCASCADE
+    boolean intersection to detect shared volume, and
+    BRepExtrema_DistShapeShape for exact minimum distance when there is no
+    shared volume.
+
+    Returns a list of per-pair result dicts with keys:
+    component_a_id, component_a_name, component_b_id, component_b_name,
+    status ('pass'|'fail'|'warning'|'not_checked'), min_distance_mm,
+    requested_clearance_mm, interference (bool), reason (str or None).
+    """
+    results = []
+
+    if len(components) < 2:
+        return results
+
+    def _topods(solid):
+        try:
+            return solid.wrapped
+        except Exception:
+            try:
+                return solid.val().wrapped
+            except Exception:
+                return solid
+
+    def _exact_distance(solid_a, solid_b):
+        """Return exact minimum distance, or None when it cannot be computed."""
+        value = None
+        try:
+            from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+            dc = BRepExtrema_DistShapeShape(_topods(solid_a), _topods(solid_b))
+            dc.Perform()
+            value = dc.Value()
+        except Exception:
+            try:
+                from OCC.Core.BRepExtrema import BRepExtrema_DistShapeShape
+                dc = BRepExtrema_DistShapeShape(_topods(solid_a), _topods(solid_b))
+                dc.Perform()
+                value = dc.Value()
+            except Exception:
+                value = None
+        if value is None or not math.isfinite(value):
+            return None
+        return float(value)
+
+    def _pair_result(comp_a, comp_b, min_dist, interference, status, reason):
+        return {
+            'component_a_id': _slugify_component_id(comp_a.name),
+            'component_a_name': comp_a.name,
+            'component_b_id': _slugify_component_id(comp_b.name),
+            'component_b_name': comp_b.name,
+            'status': status,
+            'min_distance_mm': None if min_dist is None else round(float(min_dist), 4),
+            'requested_clearance_mm': requested_clearance_mm,
+            'interference': bool(interference),
+            'reason': reason,
+        }
+
+    def _apply_clearance(min_dist, base_status, base_reason):
+        """Apply requested clearance; return (status, reason)."""
+        if requested_clearance_mm is None:
+            return base_status, base_reason
+        if min_dist is None:
+            return 'not_checked', 'minimum distance could not be computed reliably'
+        if min_dist < requested_clearance_mm:
+            return 'fail', 'Minimum distance %.3f mm is less than requested clearance %.3f mm' % (
+                min_dist, requested_clearance_mm)
+        return base_status, base_reason
+
+    try:
+        solids = list(cad_shape.Solids())
+    except Exception as exc:
+        msg = 'OpenCASCADE could not enumerate compound solids: %s.' % type(exc).__name__
+        for i in range(len(components)):
+            for j in range(i + 1, len(components)):
+                results.append(_pair_result(components[i], components[j], None, False,
+                                            'not_checked', msg))
+        return results
+
+    if len(solids) < 2:
+        return results
+
+    # Build per-solid info with bounding boxes.
+    solid_infos = []
+    for solid in solids:
+        try:
+            box = solid.BoundingBox()
+            dims = [box.xlen, box.ylen, box.zlen]
+            center = [(box.xmin + box.xmax) / 2, (box.ymin + box.ymax) / 2, (box.zmin + box.zmax) / 2]
+            volume = float(solid.Volume())
+        except Exception:
+            continue
+        solid_infos.append({
+            'solid': solid,
+            'dims': dims,
+            'center': center,
+            'volume': volume,
+            'aabb': ((box.xmin, box.ymin, box.zmin), (box.xmax, box.ymax, box.zmax)),
+        })
+
+    if len(solid_infos) < 2:
+        return results
+
+    # Match each component declaration to a solid by bounding-box dimensions.
+    assignments = []
+    used = set()
+    for comp in components:
+        comp_dims = [comp.dimensions_mm.width, comp.dimensions_mm.depth, comp.dimensions_mm.height]
+        comp_center = list(comp.position_mm)
+        best_idx = None
+        best_score = None
+        for i, si in enumerate(solid_infos):
+            if i in used:
+                continue
+            if not all(abs(si['dims'][j] - comp_dims[j]) <= CAD_TOLERANCE_MM * 4 for j in range(3)):
+                continue
+            dist = sum((si['center'][j] - comp_center[j]) ** 2 for j in range(3)) ** 0.5
+            score = (dist, si['volume'])
+            if best_score is None or score < best_score:
+                best_idx = i
+                best_score = score
+        if best_idx is not None:
+            used.add(best_idx)
+            assignments.append((comp, best_idx))
+
+    TOL = CAD_TOLERANCE_MM
+
+    for i in range(len(assignments)):
+        for j in range(i + 1, len(assignments)):
+            comp_a, idx_a = assignments[i]
+            comp_b, idx_b = assignments[j]
+            solid_a = solid_infos[idx_a]['solid']
+            solid_b = solid_infos[idx_b]['solid']
+            aabb_a = solid_infos[idx_a]['aabb']
+            aabb_b = solid_infos[idx_b]['aabb']
+
+            # --- Broad phase: AABB separation ---
+            separated = False
+            gap = 0.0
+            for axis in range(3):
+                if aabb_a[1][axis] < aabb_b[0][axis] - TOL:
+                    separated = True
+                    gap = max(gap, aabb_b[0][axis] - aabb_a[1][axis])
+                elif aabb_b[1][axis] < aabb_a[0][axis] - TOL:
+                    separated = True
+                    gap = max(gap, aabb_a[0][axis] - aabb_b[1][axis])
+
+            if separated:
+                # AABBs don't overlap - compute exact or AABB-gap distance.
+                min_dist = _exact_distance(solid_a, solid_b)
+                if min_dist is None:
+                    min_dist = gap  # AABB gap is a reliable lower bound when separated.
+                status, reason = _apply_clearance(min_dist, 'pass', None)
+                results.append(_pair_result(comp_a, comp_b, min_dist, False, status, reason))
+                continue
+
+            # --- Narrow phase: AABBs overlap or touch ---
+            # Test for shared volume via OpenCASCADE boolean intersection.
+            intersection_volume = 0.0
+            try:
+                inter = solid_a.intersect(solid_b)
+                if inter is not None:
+                    try:
+                        intersection_volume = float(inter.Volume())
+                    except Exception:
+                        intersection_volume = 0.0
+            except Exception:
+                intersection_volume = 0.0
+
+            if intersection_volume > TOL:
+                # Genuine interference: shared volume beyond tolerance.
+                status, reason = _apply_clearance(
+                    0.0, 'fail', 'Components intersect (intersection volume %.4f mm^3)' % intersection_volume)
+                results.append(_pair_result(comp_a, comp_b, 0.0, True, status, reason))
+                continue
+
+            # No shared volume: touching (contact) or separated despite overlapping AABBs.
+            min_dist = _exact_distance(solid_a, solid_b)
+            if min_dist is None:
+                # Cannot compute exact distance; AABB gap is meaningless when
+                # AABBs overlap, so report not_checked rather than guess.
+                results.append(_pair_result(comp_a, comp_b, None, False,
+                                            'not_checked', 'minimum distance could not be computed reliably'))
+                continue
+
+            if min_dist <= TOL:
+                # Contact: touching with no shared volume.
+                status, reason = _apply_clearance(min_dist, 'warning',
+                                                  'Components are in contact (no shared volume)')
+            else:
+                # Separated in reality despite overlapping AABBs (e.g. rotated parts).
+                status, reason = _apply_clearance(min_dist, 'pass', None)
+
+            results.append(_pair_result(comp_a, comp_b, min_dist, False, status, reason))
+
+    return results

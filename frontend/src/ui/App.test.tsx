@@ -98,3 +98,111 @@ describe('App version history integration',()=>{
   expect(screen.queryByText(/an earlier version than the latest/)).toBeNull()
  })
 });
+
+describe('App optimistic messaging',()=>{
+  function bootGenerateBackend(){
+   let generateResolve:(v:any)=>void=()=>{};
+   let generateReject:(e:any)=>void=()=>{};
+   const generatePromise=new Promise<any>((res,rej)=>{generateResolve=res;generateReject=rej});
+    mockApi.mockImplementation(async(url:string)=>{
+    const target=String(url);
+    if(target.startsWith('/api/conversations?'))return {items:[{id:'conv-1',title:'Demo',archived:false,updated_at:'2026-10-25T00:00:00'}]};
+    if(target==='/api/conversations/conv-1')return {messages:[]};
+    if(target==='/api/conversations/conv-1/messages')return {};
+    if(target==='/api/models/generate'){
+     await new Promise(r=>setTimeout(r,10));
+     return generatePromise;
+    }
+    throw new Error('unexpected api call: '+target)
+   });
+   return {generateResolve,generateReject};
+  }
+
+  it('displays the user message immediately and clears the composer',async()=>{
+   bootGenerateBackend();
+   render(<App user={user} onLogout={()=>{}}/>);
+   await waitFor(()=>expect(screen.getAllByText('Demo').length).toBeGreaterThan(0));
+   const textbox=screen.getByPlaceholderText('Describe the model you have in mind') as HTMLInputElement;
+   fireEvent.change(textbox,{target:{value:'create a cylinder'}});
+   fireEvent.click(screen.getByTitle('Generate'));
+   await waitFor(()=>expect(screen.getByText('create a cylinder')).toBeTruthy());
+   expect(textbox.value).toBe('');
+  });
+
+  it('reconciles the pending assistant message on success without duplication',async()=>{
+   const {generateResolve}=bootGenerateBackend();
+   render(<App user={user} onLogout={()=>{}}/>);
+   await waitFor(()=>expect(screen.getAllByText('Demo').length).toBeGreaterThan(0));
+   const textbox=screen.getByPlaceholderText('Describe the model you have in mind');
+   fireEvent.change(textbox,{target:{value:'create a cylinder'}});
+   fireEvent.click(screen.getByTitle('Generate'));
+   await waitFor(()=>expect(screen.getByText('create a cylinder')).toBeTruthy());
+   generateResolve({model_id:'m1',version:1,spec:{shape_type:'box'},validation:{watertight:true,vertices:8,faces:12,dimensions_mm:[10,10,10]},generation_method:'parametric_cad',message:'done'});
+   await waitFor(()=>expect(screen.getByText('done')).toBeTruthy());
+   const assistantTexts=screen.getAllByText('done');
+   expect(assistantTexts).toHaveLength(1);
+  });
+
+  it('preserves the user message and shows error on failure',async()=>{
+   const {generateReject}=bootGenerateBackend();
+   render(<App user={user} onLogout={()=>{}}/>);
+   await waitFor(()=>expect(screen.getAllByText('Demo').length).toBeGreaterThan(0));
+   const textbox=screen.getByPlaceholderText('Describe the model you have in mind');
+   fireEvent.change(textbox,{target:{value:'create a cylinder'}});
+   fireEvent.click(screen.getByTitle('Generate'));
+   await waitFor(()=>expect(screen.getByText('create a cylinder')).toBeTruthy());
+   generateReject(new Error('boom'));
+   await waitFor(()=>expect(screen.getAllByText('boom').length).toBeGreaterThan(0));
+  });
+
+  it('prevents duplicate submissions while loading',async()=>{
+   const {generateResolve}=bootGenerateBackend();
+   render(<App user={user} onLogout={()=>{}}/>);
+   await waitFor(()=>expect(screen.getAllByText('Demo').length).toBeGreaterThan(0));
+   const textbox=screen.getByPlaceholderText('Describe the model you have in mind');
+   fireEvent.change(textbox,{target:{value:'create a cylinder'}});
+   const sendBtn=screen.getByTitle('Generate');
+   fireEvent.click(sendBtn);
+   // Second click should be ignored (button changes to Stop while loading)
+   await waitFor(()=>expect(screen.queryByTitle('Generate')).toBeNull());
+   generateResolve({model_id:'m1',version:1,spec:{shape_type:'box'},validation:{watertight:true,vertices:8,faces:12,dimensions_mm:[10,10,10]},generation_method:'parametric_cad',message:'done'});
+   await waitFor(()=>expect(screen.getByText('done')).toBeTruthy());
+   const generateCalls=mockApi.mock.calls.filter(call=>String(call[0])==='/api/models/generate');
+   expect(generateCalls).toHaveLength(1);
+  });
+});
+
+describe('App conversation dialogs',()=>{
+  function bootSimpleBackend(){
+   mockApi.mockImplementation(async(url:string)=>{
+    const target=String(url);
+    if(target.startsWith('/api/conversations?'))return {items:[{id:'conv-1',title:'Demo',archived:false,updated_at:'2026-10-25T00:00:00'}]};
+    if(target==='/api/conversations/conv-1')return {messages:[]};
+    if(target.startsWith('/api/conversations/')&&target.endsWith('/messages'))return {};
+    if(target.startsWith('/api/conversations/')&&!target.endsWith('/messages')&&!target.endsWith('/models'))return {id:'conv-1',title:'Demo'};
+    throw new Error('unexpected api call: '+target)
+   });
+  }
+
+  it('rename dialog opens with current title',async()=>{
+   bootSimpleBackend();
+   render(<App user={user} onLogout={()=>{}}/>);
+   await waitFor(()=>expect(screen.getByTitle('Rename conversation')).toBeTruthy());
+   fireEvent.click(screen.getByTitle('Rename conversation'));
+   await waitFor(()=>expect(screen.getAllByRole('textbox')).toHaveLength(2));
+   const inputs=screen.getAllByRole('textbox');
+   const dialogInput=inputs.find(i=>i.getAttribute('placeholder')==='Enter a name') as HTMLInputElement;
+   expect(dialogInput.value).toBe('Demo');
+   fireEvent.click(screen.getByTitle('Cancel'));
+  });
+
+  it('delete dialog opens',async()=>{
+   bootSimpleBackend();
+   render(<App user={user} onLogout={()=>{}}/>);
+   await waitFor(()=>expect(screen.getByTitle('Delete conversation')).toBeTruthy());
+   fireEvent.click(screen.getByTitle('Delete conversation'));
+   await waitFor(()=>expect(screen.getByText(/Delete conversation/)).toBeTruthy());
+   fireEvent.click(screen.getByTitle('Cancel'));
+  });
+});
+

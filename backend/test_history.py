@@ -383,6 +383,81 @@ def test_single_object_export_unchanged(client):
     assert 'modelforge.stl' in served.headers['content-disposition']
 
 
+def test_single_object_step_export(client):
+    conv = _new_conversation(client, 'SingleStep')
+    made = _generate_cylinder(client, conv['id'])
+    served = client.get(f"/api/models/{made['model_id']}/export?format=step")
+    assert served.status_code == 200, served.text
+    assert 'step' in served.headers['content-type'].lower()
+    assert 'modelforge.step' in served.headers['content-disposition']
+    assert len(served.content) > 100
+
+
+def test_assembly_combined_step_export(client):
+    conv = _new_conversation(client, 'AssemblyStep')
+    model = _generate_assembly(client, conv['id'])
+    served = client.get(f"/api/models/{model['model_id']}/export?format=step")
+    assert served.status_code == 200, served.text
+    assert 'step' in served.headers['content-type'].lower()
+    assert 'modelforge.step' in served.headers['content-disposition']
+    assert len(served.content) > 100
+
+
+def test_assembly_per_component_step_export(client):
+    conv = _new_conversation(client, 'AssemblyComponentStep')
+    model = _generate_assembly(client, conv['id'])
+    body_id = next(c['id'] for c in model['components'] if 'body' in c['id'])
+    served = client.get(f"/api/models/{model['model_id']}/export?format=step&component={body_id}")
+    assert served.status_code == 200, served.text
+    assert 'step' in served.headers['content-type'].lower()
+    assert f'modelforge-{body_id}.step' in served.headers['content-disposition']
+    assert len(served.content) > 100
+    # Different components produce different STEP bytes.
+    lid_id = next(c['id'] for c in model['components'] if 'lid' in c['id'])
+    lid_step = client.get(f"/api/models/{model['model_id']}/export?format=step&component={lid_id}")
+    assert lid_step.status_code == 200, lid_step.text
+    assert served.content != lid_step.content
+
+
+def test_assembly_step_export_invalid_component(client):
+    conv = _new_conversation(client, 'StepInvalidComponent')
+    model = _generate_assembly(client, conv['id'])
+    served = client.get(f"/api/models/{model['model_id']}/export?format=step&component=nonexistent_part")
+    assert served.status_code == 404, served.text
+
+
+def test_assembly_step_export_unauthorized(client, database):
+    conv = _new_conversation(client, 'StepUnauthorized')
+    model = _generate_assembly(client, conv['id'])
+    body_id = model['components'][0]['id']
+    client.test_identity['user'] = database['other']
+    served = client.get(f"/api/models/{model['model_id']}/export?format=step&component={body_id}")
+    assert served.status_code == 404, served.text
+
+
+def test_missing_step_artifact(client, database):
+    conv = _new_conversation(client, 'StepMissingArtifact')
+    model_id = str(uuid.uuid4())
+    with database['factory']() as db:
+        db.add(GeneratedModel(id=model_id, owner_id=database['user'].id, conversation_id=conv['id'],
+                              shape_type='box', generation_method='parametric_cad', version=1,
+                              parameters_json={'shape_type': 'box',
+                                               'dimensions_mm': {'width': 10.0, 'depth': 10.0, 'height': 10.0}},
+                              validation_json={'watertight': True, 'vertices': 8, 'faces': 12,
+                                               'dimensions_mm': [10.0, 10.0, 10.0]},
+                              storage_key=str(uuid.uuid4())))
+        db.commit()
+    assert client.get(f'/api/models/{model_id}').status_code == 410
+    assert client.get(f'/api/models/{model_id}/export?format=step').status_code == 410
+
+
+def test_export_unsupported_format_still_rejected(client):
+    conv = _new_conversation(client, 'ExportFormat')
+    model = _generate_assembly(client, conv['id'])
+    served = client.get(f"/api/models/{model['model_id']}/export?format=obj")
+    assert served.status_code == 422, served.text
+
+
 # ---------------------------------------------------------------------------
 # Phase 2: Gemini multi-component assembly tests (mocked provider)
 # ---------------------------------------------------------------------------

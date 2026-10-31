@@ -39,6 +39,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
 
 DEFAULT_WALL_TIMEOUT_S = 90.0
 DEFAULT_CPU_SECONDS = 30.0
@@ -349,7 +350,7 @@ def _killed_error(proc, cpu_seconds: float, code: str, message: str) -> ScriptSa
     return ScriptSandboxError(code, message)
 
 
-def run_script(script: str, wall_timeout_s: float = None, cpu_seconds: float = None):
+def run_script(script: str, wall_timeout_s: float = None, cpu_seconds: float = None, request_id: str | None = None):
     """Execute the script; return ``(brep_path, workdir)`` on success.
 
     The caller must import/remove the B-rep file and finish the work
@@ -359,6 +360,10 @@ def run_script(script: str, wall_timeout_s: float = None, cpu_seconds: float = N
     Limits: explicit arguments win; otherwise the ``MF_*`` environment
     overrides apply per run (values are validated and clamped); otherwise
     the tuned module defaults.
+
+    :param request_id: optional request ID for targeted cancellation; when
+        provided, the sandbox worker process is registered so that
+        :func:`cancel_run` can terminate only this operation's worker tree.
     """
     if not available():
         raise ScriptSandboxError('unsupported_platform', 'The generated script sandbox requires Windows.')
@@ -378,7 +383,7 @@ def run_script(script: str, wall_timeout_s: float = None, cpu_seconds: float = N
     memory_bytes = _clamped_int(os.environ.get('MF_SANDBOX_MEMORY_BYTES', ''), MEMORY_LIMIT_BYTES, 128 * 1024 * 1024, 8 * 1024 * 1024 * 1024)
     workdir = tempfile.mkdtemp(prefix='mf-script-')
     try:
-        brep_path = _run_in_sandbox(script, workdir, wall_timeout_s, cpu_seconds, memory_bytes)
+        brep_path = _run_in_sandbox(script, workdir, wall_timeout_s, cpu_seconds, memory_bytes, request_id=request_id)
         max_brep_bytes = _clamped_int(os.environ.get('MF_MAX_BREP_BYTES', ''), MAX_BREP_BYTES, 256, 512 * 1024 * 1024)
         size = os.path.getsize(brep_path)
         if size > max_brep_bytes:
@@ -389,7 +394,7 @@ def run_script(script: str, wall_timeout_s: float = None, cpu_seconds: float = N
         raise
 
 
-def _run_in_sandbox(script: str, workdir: str, wall_timeout_s: float, cpu_seconds: float, memory_bytes: int) -> str:
+def _run_in_sandbox(script: str, workdir: str, wall_timeout_s: float, cpu_seconds: float, memory_bytes: int, request_id: str | None = None) -> str:
     """Worker lifecycle. Returns the BREP path only when the sandbox reports success."""
     payload_path = os.path.join(workdir, 'payload.json')
     runner_path = os.path.join(workdir, 'runner.py')
@@ -430,6 +435,8 @@ def _run_in_sandbox(script: str, workdir: str, wall_timeout_s: float, cpu_second
         if not _assign(job, proc):
             raise _killed_error(proc, cpu_seconds, 'startup_failed',
                                 'The sandbox worker could not be attached to its resource limits.')
+        if request_id is not None:
+            _store_run(request_id, proc, job)
         deadline = time.monotonic() + wall_timeout_s
         while not os.path.isfile(ready_path):
             if proc.poll() is not None:
@@ -464,6 +471,8 @@ def _run_in_sandbox(script: str, workdir: str, wall_timeout_s: float, cpu_second
         raise _killed_error(proc, cpu_seconds, 'crashed',
                             'The sandbox worker stopped without a diagnosis.')
     finally:
+        if request_id is not None:
+            _pop_run(request_id)
         _kill_tree(job, proc)
         if job is not None:
             try:
@@ -482,3 +491,53 @@ def cleanup_workdir(workdir: str):
         shutil.rmtree(workdir, ignore_errors=True)
         if not os.path.isdir(workdir):
             return
+
+
+# ---------------------------------------------------------------------------
+# Request-specific cancellation support for the sandbox worker.
+#
+# Active runs are keyed by request_id so cancellation can terminate only the
+# targeted worker process tree via its Job Object. Stale entries are removed
+# when the run completes (success or failure) via _run_in_sandbox's finally
+# block, and explicitly by cancel_run.
+# ---------------------------------------------------------------------------
+_active_runs: dict[str, dict] = {}
+_active_runs_lock = threading.Lock()
+
+
+def _store_run(request_id: str, proc: "subprocess.Popen[str]", job: object) -> None:
+    with _active_runs_lock:
+        _active_runs[request_id] = {'proc': proc, 'job': job}
+
+
+def _pop_run(request_id: str) -> dict | None:
+    with _active_runs_lock:
+        return _active_runs.pop(request_id, None)
+
+
+def cancel_run(request_id: str) -> bool:
+    """Terminate only the sandbox worker tree belonging to request_id.
+
+    Returns True when a live run was found and terminated, False when no
+    active run exists for that request ID (already completed, never started,
+    or unknown). Safe to call repeatedly (idempotent).
+    """
+    entry = _pop_run(request_id)
+    if entry is None:
+        return False
+    proc = entry.get('proc')
+    job = entry.get('job')
+    if proc is not None and proc.poll() is None:
+        try:
+            if job is not None:
+                _kernel32.TerminateJobObject(job, 1)
+            proc.kill()
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+    return True
+
+
+def has_active_run(request_id: str) -> bool:
+    with _active_runs_lock:
+        return request_id in _active_runs

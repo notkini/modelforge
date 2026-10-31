@@ -20,6 +20,7 @@ import trimesh
 from .cad_geometry import (cadquery_module, script_dimension_tolerance, validate_from_cad_shape,
                            split_compound_components, TESSELLATION_TOLERANCE_MM, ANGULAR_TOLERANCE_RAD)
 from .config import get_settings
+from .cancellation import RequestCancellation
 from .nlp import _gemini_failure_category, _gemini_failure_reason
 from .script_runner import ScriptSandboxError, cleanup_workdir, run_script
 
@@ -166,11 +167,14 @@ def _script_message(request: ScriptRequest, history: list) -> str:
     return '\n'.join(parts)
 
 
-def _call_gemini(message: str) -> str:
+def _call_gemini(message: str, api_key: Optional[str] = None) -> str:
     from google import genai
     from google.genai import types
     settings = get_settings()
-    client = genai.Client(api_key=settings['gemini_api_key'], http_options=types.HttpOptions(timeout=60000))
+    key = api_key or settings['gemini_api_key']
+    if not key:
+        raise CodegenError('authentication_or_permission', 'No Gemini API key available.')
+    client = genai.Client(api_key=key, http_options=types.HttpOptions(timeout=60000))
     try:
         response = client.models.generate_content(
             model=settings['gemini_model'], contents=message,
@@ -221,12 +225,33 @@ def _import_brep(brep_path: str):
     return shape.val() if hasattr(shape, 'val') else shape
 
 
-def _attempt(request: ScriptRequest, history: list):
+def _attempt(request: ScriptRequest, history: list, cancel_check: Optional[callable] = None, api_key: Optional[str] = None):
+    """Single generation attempt with cancellation checkpoints.
+
+    :param cancel_check: callable returning True when cancellation has been
+        requested. Checked before Gemini call, before script execution, and
+        before validation/tessellation.
+    :param api_key: user-level Gemini API key, falling back to the server key
+        when not provided.
+    """
+    if cancel_check is not None and cancel_check():
+        raise CodegenError('cancelled', 'Operation cancelled before Gemini call.')
     message = _script_message(request, history)
-    text = _call_gemini(message)
+    if cancel_check is not None and cancel_check():
+        raise CodegenError('cancelled', 'Operation cancelled after Gemini response preparation.')
+    if api_key is not None:
+        text = _call_gemini(message, api_key=api_key)
+    else:
+        text = _call_gemini(message)
+    if cancel_check is not None and cancel_check():
+        raise CodegenError('cancelled', 'Operation cancelled after Gemini response.')
     code = _parse_code_block(text)
     plan = _parse_plan(code)
+    if cancel_check is not None and cancel_check():
+        raise CodegenError('cancelled', 'Operation cancelled before script execution.')
     brep_path, workdir = run_script(code)
+    if cancel_check is not None and cancel_check():
+        raise CodegenError('cancelled', 'Operation cancelled after script execution.')
     try:
         cad_shape = _import_brep(brep_path)
         cad_shape, mesh, validation = validate_from_cad_shape(
@@ -327,13 +352,21 @@ def _attempt(request: ScriptRequest, history: list):
             cad_shape, mesh, validation, plan, component_meshes)
 
 
-def build_script(request: ScriptRequest) -> CodegenResult:
-    """Gemini -> runnable script; bounded sanitized repair loop; strict validation."""
+def build_script(request: ScriptRequest, cancel_check: Optional[callable] = None, api_key: Optional[str] = None) -> CodegenResult:
+    """Gemini -> runnable script; bounded sanitized repair loop; strict validation.
+
+    :param cancel_check: callable returning True when cancellation has been
+        requested. Checked before each repair attempt.
+    :param api_key: user-level Gemini API key, falling back to the server key
+        when not provided.
+    """
     history: list = []
     last_error: CodegenError = CodegenError('request_failed', 'Script generation did not start.')
     for attempt in range(1, MAX_ATTEMPTS + 1):
+        if cancel_check is not None and cancel_check():
+            raise CodegenError('cancelled', 'Operation cancelled before attempt %d.' % attempt)
         try:
-            code, explanation, cad_shape, mesh, validation, plan, component_meshes = _attempt(request, history)
+            code, explanation, cad_shape, mesh, validation, plan, component_meshes = _attempt(request, history, cancel_check=cancel_check, api_key=api_key)
             return CodegenResult(code=code, explanation=explanation, attempts=attempt, plan=plan,
                                  repair_history=history, mesh=mesh, cad_shape=cad_shape, validation=validation,
                                  component_meshes=component_meshes)

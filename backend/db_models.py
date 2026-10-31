@@ -73,3 +73,13 @@ class AuthNonce(Base):
     nonce_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
     csrf_hash: Mapped[str] = mapped_column(String(64))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class UserSetting(Base):
+    __tablename__ = 'user_settings'
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey('users.id', ondelete='CASCADE'), index=True, unique=True)
+    provider: Mapped[str] = mapped_column(String(20), default='local', nullable=False)
+    api_key_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    connection_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)

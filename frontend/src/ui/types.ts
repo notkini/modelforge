@@ -1,4 +1,10 @@
 export type InterpreterChoice='auto'|'gemini'|'local';
+export type SettingsProvider='gemini'|'local';
+export type Settings={
+  provider:SettingsProvider;
+  configured:boolean;
+  connection_status:'ok'|'failed'|null;
+};
 export type Spec={
  shape_type:string;
  dimensions_mm:{width:number;depth:number;height:number};
@@ -29,6 +35,27 @@ export type ComponentMeta={
   faces?:number[][];
   mesh_file:string;
 };
+export type ComponentPairCheck={
+  component_a_id:string;
+  component_a_name:string;
+  component_b_id:string;
+  component_b_name:string;
+  status:'pass'|'fail'|'warning'|'not_checked';
+  min_distance_mm?:number|null;
+  requested_clearance_mm?:number|null;
+  interference:boolean;
+  reason?:string|null;
+};
+export type ChangeSummary={
+  verified:boolean;
+  components_added?:string[];
+  components_removed?:string[];
+  components_modified?:string[];
+  dimensions_changed?:{old:number[];new:number[]}|null;
+  validation_changed?:Record<string,{old:unknown;new:unknown}>;
+  warnings?:string[];
+  note?:string|null;
+};
 export type Model={
   model_id:string;
   spec:Spec;
@@ -45,6 +72,8 @@ export type Model={
    warnings?:string[];
    components?:string[];
    component_count?:number;
+   component_pairs?:ComponentPairCheck[];
+   change_summary?:ChangeSummary;
    [key:string]:unknown
   };
   generation_method:string;
@@ -54,14 +83,17 @@ export type Model={
   interpretation_provider?:string;
   geometry_generation_method?:string;
   fallback_reason?:string|null;
-  message?:string
+  message?:string;
+  request_id?:string|null;
 };
 export type Message={
  id?:string;
  role:'user'|'assistant'|'system';
  text:string;
  model?:Model;
- metadata?:Record<string,unknown>
+ metadata?:Record<string,unknown>;
+ status?: 'pending' | 'complete' | 'failed' | 'cancelled';
+ optimisticId?: string;
 };
 export type Conversation={
  id:string;

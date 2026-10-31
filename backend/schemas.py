@@ -383,12 +383,33 @@ class Spec(BaseModel):
 
 InterpreterChoice=Literal['auto','gemini','local']
 
+SettingsProvider=Literal['gemini','local']
+
+class SettingsSave(BaseModel):
+    provider: SettingsProvider
+    api_key: Optional[str] = Field(default=None, max_length=4000)
+
+class SettingsResponse(BaseModel):
+    provider: SettingsProvider
+    configured: bool
+    connection_status: Optional[str] = None
+
+class SettingsTestRequest(BaseModel):
+    provider: SettingsProvider = 'gemini'
+    api_key: Optional[str] = Field(default=None, max_length=4000)
+
+class SettingsTestResponse(BaseModel):
+    status: str  # 'ok' | 'failed'
+    message: str
+
+
 class GenerateRequest(BaseModel):
     spec: Optional[Spec] = None
     prompt: str = Field(default='', max_length=4000)
     conversation_id: Optional[str] = None
     parent_model_id: Optional[str] = None
     interpreter: Optional[InterpreterChoice] = None
+    clearance_mm: Optional[float] = Field(default=None, ge=0)
 
 class ParseRequest(BaseModel):
     prompt: str = Field(min_length=3, max_length=1000)
@@ -398,6 +419,7 @@ class RefineRequest(BaseModel):
     model_id: Optional[str] = None
     instruction: str = Field(min_length=3, max_length=500)
     interpreter: Optional[InterpreterChoice] = None
+    clearance_mm: Optional[float] = Field(default=None, ge=0)
 
 class ConversationCreate(BaseModel):
     title: str = Field(default='New creation', min_length=1, max_length=240)
@@ -467,3 +489,13 @@ class InterpretRequest(BaseModel):
     previous_spec: Optional[Spec] = None
     recent_context: list[dict] = Field(default_factory=list, max_length=8)
     interpreter: Optional[InterpreterChoice] = None
+
+
+class CancelRequest(BaseModel):
+    request_id: str = Field(min_length=1, max_length=128)
+
+
+class CancelResponse(BaseModel):
+    request_id: str
+    cancelled: bool
+    status: str  # 'running' | 'cancellation_requested' | 'cancelled' | 'completed' | 'failed' | 'unknown'

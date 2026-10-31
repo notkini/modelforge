@@ -117,12 +117,12 @@ export function friendlyError(message: string, status: number): string {
   return message || `Request failed (${status}).`;
 }
 
-export async function api<T>(url:string,body?:unknown,method?:string):Promise<T>{
+export async function api<T>(url:string,body?:unknown,method?:string,signal?:AbortSignal):Promise<T>{
  const verb=method||(body===undefined?'GET':'POST');
  const headers:Record<string,string>={};
  if(body!==undefined)headers['Content-Type']='application/json';
  if(verb!=='GET'&&csrfToken)headers['X-CSRF-Token']=csrfToken;
- const response=await fetch(url,{method:verb,headers,credentials:'include',...(body===undefined?{}:{body:JSON.stringify(body)})});
+ const response=await fetch(url,{method:verb,headers,credentials:'include',signal,...(body===undefined?{}:{body:JSON.stringify(body)})});
  if(!response.ok){
    const payload=await response.json().catch(()=>null);
    const raw=payload?.detail?.message||`Request failed (${response.status}).`;

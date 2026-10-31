@@ -1,3 +1,4 @@
+from typing import Optional
 import numpy as np
 import trimesh
 from skimage.measure import marching_cubes
@@ -51,13 +52,13 @@ def _gaussian(spec):
     mesh.apply_scale([w/ext[0],d/ext[1],h/ext[2]])
     return mesh
 
-def generate_with_kernel(spec: Spec):
+def generate_with_kernel(spec: Spec, requested_clearance_mm: Optional[float] = None):
     if spec.shape_type=='organic':
         mesh=_mesh(spec); kernel_shape=None
         generation_method='gaussian_implicit_mesh'
     else:
         from .cad_geometry import generate_cad
-        kernel_shape,mesh,validation=generate_cad(spec)
+        kernel_shape,mesh,validation=generate_cad(spec, requested_clearance_mm=requested_clearance_mm)
         return mesh,validation,kernel_shape
     if len(mesh.vertices)==0 or not np.isfinite(mesh.vertices).all(): raise ValueError('Geometry is empty or contains non-finite vertices.')
     mesh.fix_normals()

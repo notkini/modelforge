@@ -17,18 +17,22 @@ from sqlalchemy.orm import Session
 from .auth import (CSRF_COOKIE, NONCE_COOKIE, SESSION_COOKIE, _digest, cookie_settings,
                    csrf_protected, current_user, hash_password, issue_session, user_payload, verify_password)
 from .config import get_settings
+from .crypto import decrypt_api_key, encrypt_api_key
 from .database import get_db
-from .db_models import AuthNonce, AuthSession, Conversation, GeneratedModel, Message, User, now_utc
+from .db_models import AuthNonce, AuthSession, Conversation, GeneratedModel, Message, User, UserSetting, now_utc
 from .geometry import generate_with_kernel
 from .import codegen
 from .cad_geometry import save_step, split_compound_components
 from .interpreter import ParseError
 from .nlp import InterpretationResult, UnsupportedGeometry, _GeminiRoutingSignal, interpret
-from .script_runner import ScriptSandboxError
-from .schemas import (ComponentMeta, ConversationCreate, ConversationPatch, GenerateRequest, InterpretRequest,
+from .cancellation import registry as cancellation_registry, new_request_id, RequestCancellation
+from .script_runner import ScriptSandboxError, cancel_run as sandbox_cancel_run
+from .schemas import (CancelRequest, CancelResponse, ComponentMeta, ConversationCreate, ConversationPatch, GenerateRequest, InterpretRequest,
                       LocalImportRequest, MessageCreate, ParseRequest, RefineRequest, Spec)
+from .api_settings import router as settings_router
 
 router=APIRouter(prefix='/api')
+router.include_router(settings_router)
 logger=logging.getLogger(__name__)
 _rate_windows=defaultdict(deque)
 
@@ -280,7 +284,7 @@ def _artifact_folder(user: User, model: GeneratedModel) -> Path:
     if root not in folder.parents: raise HTTPException(404,detail={'message':'Model artifact not found.'})
     return folder
 
-def _save_mesh(user: User, model_id: str, mesh: trimesh.Trimesh, cad_shape=None, component_meshes=None) -> str:
+def _save_mesh(user: User, model_id: str, mesh: trimesh.Trimesh, cad_shape=None, component_meshes=None, component_solids=None) -> str:
     folder=(get_settings()['artifact_dir']/user.id/model_id).resolve()
     folder.mkdir(parents=True,exist_ok=True)
     if get_settings()['artifact_dir'] not in folder.parents: raise ValueError('Invalid private artifact location.')
@@ -291,6 +295,16 @@ def _save_mesh(user: User, model_id: str, mesh: trimesh.Trimesh, cad_shape=None,
         for comp_id,comp_mesh in component_meshes:
             safe_id=_slugify_component_id(comp_id)
             np.savez_compressed(folder/f'mesh_{safe_id}.npz',vertices=comp_mesh.vertices.astype(np.float32),faces=comp_mesh.faces.astype(np.int32))
+    # Save per-component STEP files for compound assemblies.
+    if component_solids:
+        for comp_id,solid in component_solids:
+            safe_id=_slugify_component_id(comp_id)
+            try:
+                save_step(solid,folder/f'step_{safe_id}.step')
+            except Exception as exc:
+                # A STEP failure for one component must not abort the whole save;
+                # the missing per-component STEP is reported as a 404 on export.
+                logger.warning('per-component STEP save failed for %s: %s', comp_id, type(exc).__name__)
     return model_id
 
 def _load_mesh(user: User,model: GeneratedModel,component_id: Optional[str]=None) -> trimesh.Trimesh:
@@ -318,7 +332,62 @@ def _remove_artifact(model: GeneratedModel,user: User):
             if p.is_file(): p.unlink()
         folder.rmdir()
 
-def _model_json(model_id: str,spec,mesh: trimesh.Trimesh,validation: dict,method: str,version: int,parent: Optional[str],include_mesh=True,user: Optional[User]=None):
+def _build_change_summary(old_model: Optional[GeneratedModel], new_validation: dict, new_components: Optional[list] = None) -> dict:
+    """Build a structured change summary comparing an old model to a new one.
+
+    Derived only from structured JSON metadata — never from LLM explanation text.
+    Returns {'verified': False, ...} when no parent exists or comparison is not possible.
+    """
+    if old_model is None:
+        return {'verified': False, 'note': 'No parent model to compare.'}
+
+    old_validation = old_model.validation_json or {}
+    old_components = old_validation.get('components_detail') or old_validation.get('components') or []
+    if not isinstance(old_components, list):
+        old_components = []
+
+    new_components = new_components or []
+    if not isinstance(new_components, list):
+        new_components = []
+
+    old_by_name = {c.get('name'): c for c in old_components if isinstance(c, dict)}
+    new_by_name = {c.get('name'): c for c in new_components if isinstance(c, dict)}
+    old_names = set(old_by_name)
+    new_names = set(new_by_name)
+
+    summary = {
+        'verified': True,
+        'components_added': sorted(new_names - old_names),
+        'components_removed': sorted(old_names - new_names),
+        'components_modified': [],
+        'dimensions_changed': None,
+        'validation_changed': {},
+        'warnings': list(new_validation.get('warnings', [])),
+    }
+
+    for name in sorted(old_names & new_names):
+        old_comp = old_by_name.get(name, {})
+        new_comp = new_by_name.get(name, {})
+        if (old_comp.get('dimensions_mm') != new_comp.get('dimensions_mm') or
+                old_comp.get('position_mm') != new_comp.get('position_mm') or
+                old_comp.get('rotation_deg') != new_comp.get('rotation_deg')):
+            summary['components_modified'].append(name)
+
+    old_dims = old_validation.get('dimensions_mm')
+    new_dims = new_validation.get('dimensions_mm')
+    if old_dims and new_dims and [round(float(v), 4) for v in old_dims] != [round(float(v), 4) for v in new_dims]:
+        summary['dimensions_changed'] = {'old': old_dims, 'new': new_dims}
+
+    for key in ('watertight', 'solid_count', 'vertices', 'faces'):
+        old_val = old_validation.get(key)
+        new_val = new_validation.get(key)
+        if old_val != new_val:
+            summary['validation_changed'][key] = {'old': old_val, 'new': new_val}
+
+    return summary
+
+
+def _model_json(model_id: str,spec,mesh: trimesh.Trimesh,validation: dict,method: str,version: int,parent: Optional[str],include_mesh=True,user: Optional[User]=None,change_summary: Optional[dict]=None):
     parameters=spec.model_dump() if isinstance(spec,Spec) else dict(spec)
     result={'model_id':model_id,'spec':parameters,'validation':validation,'generation_method':method,'version':version,'parent_version_id':parent}
     if include_mesh: result.update({'vertices':mesh.vertices.tolist(),'faces':mesh.faces.tolist()})
@@ -340,14 +409,46 @@ def _model_json(model_id: str,spec,mesh: trimesh.Trimesh,validation: dict,method
         result['components']=enriched
     elif isinstance(validation.get('components'),list):
         result['components']=validation['components']
+    if change_summary is not None:
+        result['change_summary'] = change_summary
     return result
 
-def _resolve_interpreter(interpreter: Optional[str]) -> str:
-    if not interpreter or interpreter=='auto':
-        return 'gemini' if get_settings()['gemini_api_key'] else 'local'
-    if interpreter not in ('gemini','local'):
-        raise HTTPException(422,detail={'message':"Unrecognized interpreter selection: use 'auto', 'gemini', or 'local'."})
-    return interpreter
+def _get_user_decrypted_key(user: User, db: Session) -> Optional[str]:
+    setting = db.query(UserSetting).filter(UserSetting.user_id == user.id).first()
+    if setting and setting.api_key_encrypted:
+        return decrypt_api_key(setting.api_key_encrypted)
+    return None
+
+
+def _resolve_interpreter(interpreter: Optional[str], user: User, db: Session) -> tuple[str, Optional[str]]:
+    """Resolve interpreter choice and the user-level Gemini API key.
+
+    Returns (provider, user_key). user_key is the user's decrypted key when
+    they have one stored, otherwise None (the server-level GEMINI_API_KEY is
+    used by codegen as the fallback). A user who chose Local Only never
+    receives the server key.
+    """
+    settings = get_settings()
+    server_key = settings['gemini_api_key']
+
+    if interpreter is not None and interpreter not in ('gemini', 'local', 'auto'):
+        raise HTTPException(422, detail={'message':"Unrecognized interpreter selection: use 'auto', 'gemini', or 'local'."})
+
+    if interpreter == 'local':
+        return 'local', None
+    if interpreter == 'gemini':
+        key = _get_user_decrypted_key(user, db)
+        return 'gemini', key
+
+    # auto or None: consult the user's stored preference first.
+    setting = db.query(UserSetting).filter(UserSetting.user_id == user.id).first()
+    if setting:
+        if setting.provider == 'local':
+            return 'local', None
+        return 'gemini', _get_user_decrypted_key(user, db)
+
+    # No stored preference: fall back to the server-level key.
+    return ('gemini', None) if server_key else ('local', None)
 
 SANDBOX_CODES_503={'timeout','cpu_limit','memory_limit','internal_error','startup_failed','unsupported_platform','script_too_large','output_too_large','invalid_payload'}
 
@@ -355,12 +456,13 @@ def _codegen_http_error(exc: codegen.CodegenError) -> HTTPException:
     status=503 if exc.code in SANDBOX_CODES_503 else 422
     return HTTPException(status,detail={'message':exc.message})
 
-def _create_model(db: Session,user: User,spec: Spec,conversation: Conversation,prompt: str,provider: str,explanation: str,parent: Optional[GeneratedModel]=None,fallback_reason: Optional[str]=None):
-    mesh,validation,cad_shape=generate_with_kernel(spec)
+def _create_model(db: Session,user: User,spec: Spec,conversation: Conversation,prompt: str,provider: str,explanation: str,parent: Optional[GeneratedModel]=None,fallback_reason: Optional[str]=None,clearance_mm: Optional[float]=None):
+    mesh,validation,cad_shape=generate_with_kernel(spec, requested_clearance_mm=clearance_mm)
     version=(db.query(func.max(GeneratedModel.version)).filter(GeneratedModel.conversation_id==conversation.id).scalar() or 0)+1
     model_id=str(uuid.uuid4()); method='gaussian_implicit_mesh' if spec.shape_type=='organic' else 'parametric_cad'
     validation['generation_method']=method
     component_meshes=[]
+    component_solids=[]
     if spec.shape_type=='assembly':
         validation['component_count']=len(spec.components)
         validation['components']=[component.name for component in spec.components]
@@ -368,9 +470,11 @@ def _create_model(db: Session,user: User,spec: Spec,conversation: Conversation,p
         if spec.assembly_mode=='compound' and cad_shape is not None:
             try:
                 split=split_compound_components(cad_shape,spec.components)
-                for comp,solid_mesh in split:
+                component_solids=[]
+                for comp,solid_mesh,solid in split:
                     comp_id=_slugify_component_id(comp.name)
                     component_meshes.append((comp_id,solid_mesh))
+                    component_solids.append((comp_id,solid))
                     validation.setdefault('components_detail',[]).append(ComponentMeta(
                         id=comp_id,name=comp.name,
                         dimensions_mm=[comp.dimensions_mm.width,comp.dimensions_mm.depth,comp.dimensions_mm.height],
@@ -403,7 +507,7 @@ def _create_model(db: Session,user: User,spec: Spec,conversation: Conversation,p
     db.add(msg); db.flush()
     model=GeneratedModel(id=model_id,owner_id=user.id,conversation_id=conversation.id,message_id=msg.id,parent_version_id=parent.id if parent else None,shape_type=spec.shape_type,generation_method=method,parameters_json=spec.model_dump(),validation_json=validation,version=version,storage_key=model_id)
     db.add(model); conversation.updated_at=now_utc(); db.flush()
-    _save_mesh(user,model_id,mesh,cad_shape,component_meshes); db.commit()
+    _save_mesh(user,model_id,mesh,cad_shape,component_meshes,component_solids); db.commit()
     return model,mesh,validation,assistant_text
 
 def _persist_script_model(db: Session,user: User,conversation: Conversation,generation: codegen.CodegenResult,provider_label: str,prompt: str,parent: Optional[GeneratedModel]=None):
@@ -454,46 +558,62 @@ def create_model(payload: GenerateRequest,request: Request,db: Session=Depends(g
     if payload.parent_model_id:
         parent=db.query(GeneratedModel).filter(GeneratedModel.id==payload.parent_model_id,GeneratedModel.owner_id==user.id,GeneratedModel.conversation_id==conversation.id).first()
         if not parent: raise HTTPException(404,detail={'message':'Parent model not found in this conversation.'})
-    choice=_resolve_interpreter(payload.interpreter)
-    if payload.spec is None and choice=='gemini' and not get_settings()['gemini_api_key']:
+    provider, user_key = _resolve_interpreter(payload.interpreter, user, db)
+    has_any_key = bool(user_key or get_settings()['gemini_api_key'])
+    if payload.spec is None and provider == 'gemini' and not has_any_key:
         raise HTTPException(422,detail={'message':'Gemini interpretation is selected but GEMINI_API_KEY is not configured on the server.'})
-    if payload.spec is None and choice=='gemini':
-        return _generate_with_gemini_script(db,user,conversation,payload,parent)
+    request_id=new_request_id()
+    cancel_entry=cancellation_registry.register(request_id, conversation.id, user.id)
     try:
-        fallback_reason=None
-        if payload.spec is None:
-            try:
-                result=interpret(payload.prompt,interpreter=payload.interpreter or 'auto')
-            except _GeminiRoutingSignal:
-                # Auto mode: local parser cannot handle this geometry, route to Gemini.
-                if not get_settings()['gemini_api_key']:
-                    raise HTTPException(422,detail={'message':'This shape isn\'t supported by the local interpreter yet. Configure Gemini or simplify the geometry.'})
-                return _generate_with_gemini_script(db,user,conversation,payload,parent)
-            if result.needs_clarification or result.spec is None:
-                raise ParseError(result.clarifying_question or 'Please clarify the requested dimensions or shape.')
-            spec=result.spec; provider=result.provider; explanation=result.explanation; fallback_reason=result.fallback_reason
+        if payload.spec is None and provider == 'gemini':
+            return _generate_with_gemini_script(db,user,conversation,payload,parent,request_id, cancel_entry, user_key)
         else:
-            spec=payload.spec; provider='parameter-inspector'; explanation='Generated from validated ModelForge parameters.'
-        model,mesh,validation,text=_create_model(db,user,spec,conversation,payload.prompt,provider,explanation,parent,fallback_reason)
-        return {**_model_json(model.id,spec,mesh,validation,model.generation_method,model.version,model.parent_version_id,user=user),
-                'message':text,'provider':provider,'interpretation_provider':provider,
-                'geometry_generation_method':model.generation_method,'fallback_reason':fallback_reason}
-    except RuntimeError as exc: db.rollback(); raise HTTPException(503,detail={'message':str(exc)})
-    except (ValueError,UnsupportedGeometry) as exc: db.rollback(); raise HTTPException(422,detail={'message':str(exc)})
+            fallback_reason=None
+            if payload.spec is None:
+                try:
+                    result=interpret(payload.prompt,interpreter=provider)
+                except _GeminiRoutingSignal:
+                    # Auto mode: local parser cannot handle this geometry, route to Gemini.
+                    if not has_any_key:
+                        raise HTTPException(422,detail={'message':'This shape isn\'t supported by the local interpreter yet. Configure Gemini or simplify the geometry.'})
+                    return _generate_with_gemini_script(db,user,conversation,payload,parent,request_id, cancel_entry, user_key)
+                if result.needs_clarification or result.spec is None:
+                    raise ParseError(result.clarifying_question or 'Please clarify the requested dimensions or shape.')
+                spec=result.spec; provider=result.provider; explanation=result.explanation; fallback_reason=result.fallback_reason
+            else:
+                spec=payload.spec; provider='parameter-inspector'; explanation='Generated from validated ModelForge parameters.'
+            model,mesh,validation,text=_create_model(db,user,spec,conversation,payload.prompt,provider,explanation,parent,fallback_reason,payload.clearance_mm)
+            new_components=[c.model_dump() if hasattr(c,'model_dump') else c for c in spec.components] if spec.shape_type=='assembly' else []
+            cancellation_registry.complete(request_id)
+            return {**_model_json(model.id,spec,mesh,validation,model.generation_method,model.version,model.parent_version_id,user=user,
+                                  change_summary=_build_change_summary(parent, validation, new_components)),
+                    'message':text,'provider':provider,'interpretation_provider':provider,
+                    'geometry_generation_method':model.generation_method,'fallback_reason':fallback_reason,
+                    'request_id':request_id}
+    except RuntimeError as exc: cancellation_registry.fail(request_id); db.rollback(); raise HTTPException(503,detail={'message':str(exc)})
+    except (ValueError,UnsupportedGeometry) as exc: cancellation_registry.fail(request_id); db.rollback(); raise HTTPException(422,detail={'message':str(exc)})
+    except codegen.CodegenError as exc: cancellation_registry.fail(request_id); raise _codegen_http_error(exc)
 
-def _generate_with_gemini_script(db,user,conversation,payload,parent):
+def _generate_with_gemini_script(db,user,conversation,payload,parent,request_id: str, cancel_entry: RequestCancellation, user_key: Optional[str] = None):
     recent=[{'role':m.role,'text':m.text[:1000]} for m in conversation.messages[-6:]]
     request=codegen.ScriptRequest(prompt=payload.prompt,recent_context=recent)
     try:
-        generation=codegen.build_script(request)
+        call_kwargs = {'api_key': user_key} if user_key is not None else {}
+        generation=codegen.build_script(request, **call_kwargs)
+        if cancel_entry.is_cancelled():
+            cancellation_registry.cancel(request_id)
+            raise codegen.CodegenError('cancelled', 'Operation was cancelled.')
         model,mesh,validation,text=_persist_script_model(db,user,conversation,generation,'generation',payload.prompt,parent)
-        return {**_model_json(model.id,model.parameters_json,mesh,validation,model.generation_method,model.version,model.parent_version_id,user=user),
+        new_components=validation.get('components_detail', [])
+        cancellation_registry.complete(request_id)
+        return {**_model_json(model.id,model.parameters_json,mesh,validation,model.generation_method,model.version,model.parent_version_id,user=user,
+                              change_summary=_build_change_summary(parent, validation, new_components)),
                 'message':text,'provider':'gemini','interpretation_provider':'gemini',
                 'geometry_generation_method':codegen.SCRIPT_METHOD,'fallback_reason':None,
-                'script_attempts':generation.attempts}
-    except codegen.CodegenError as exc: db.rollback(); raise _codegen_http_error(exc)
-    except RuntimeError as exc: db.rollback(); raise HTTPException(503,detail={'message':str(exc)})
-    except (ValueError,UnsupportedGeometry) as exc: db.rollback(); raise HTTPException(422,detail={'message':str(exc)})
+                'script_attempts':generation.attempts,'request_id':request_id}
+    except codegen.CodegenError as exc: cancellation_registry.fail(request_id); db.rollback(); raise _codegen_http_error(exc)
+    except RuntimeError as exc: cancellation_registry.fail(request_id); db.rollback(); raise HTTPException(503,detail={'message':str(exc)})
+    except (ValueError,UnsupportedGeometry) as exc: cancellation_registry.fail(request_id); db.rollback(); raise HTTPException(422,detail={'message':str(exc)})
 
 @router.post('/models/{model_id}/refine')
 def refine_model(model_id: str,payload: RefineRequest,request: Request,db: Session=Depends(get_db),user: User=Depends(current_user),_:None=Depends(csrf_protected)):
@@ -501,64 +621,91 @@ def refine_model(model_id: str,payload: RefineRequest,request: Request,db: Sessi
     old=db.query(GeneratedModel).filter(GeneratedModel.id==model_id,GeneratedModel.owner_id==user.id).first()
     if not old: raise HTTPException(404,detail={'message':'Model not found.'})
     conversation=owned_conversation(db,old.conversation_id,user)
-    choice=_resolve_interpreter(payload.interpreter)
-    if choice=='gemini' and not get_settings()['gemini_api_key']:
+    provider, user_key = _resolve_interpreter(payload.interpreter, user, db)
+    has_any_key = bool(user_key or get_settings()['gemini_api_key'])
+    if provider == 'gemini' and not has_any_key:
         raise HTTPException(422,detail={'message':'Gemini interpretation is selected but GEMINI_API_KEY is not configured on the server.'})
     recent=[{'role':m.role,'text':m.text[:1000]} for m in conversation.messages[-6:]]
-    if old.generation_method==codegen.SCRIPT_METHOD:
-        if choice!='gemini':
-            raise HTTPException(422,detail={'message':'This model was created from a Gemini CadQuery script; refinements require the Gemini interpreter.'})
-        return _refine_script_model(db,user,conversation,old,payload,recent)
-    old_spec=Spec.model_validate(old.parameters_json)
-    if choice=='gemini':
-        return _refine_spec_through_gemini(db,user,conversation,old,payload,recent,old_spec)
-    try: result=interpret(payload.instruction,old_spec,recent,interpreter='local')
-    except (ParseError,UnsupportedGeometry,ValueError) as exc: raise HTTPException(422,detail={'message':str(exc)})
-    if result.needs_clarification or result.spec is None: raise HTTPException(422,detail={'message':result.clarifying_question or 'Please clarify the requested change.'})
+    request_id=new_request_id()
+    cancel_entry=cancellation_registry.register(request_id, conversation.id, user.id)
     try:
-        model,mesh,validation,text=_create_model(db,user,result.spec,conversation,payload.instruction,result.provider,result.explanation,old,result.fallback_reason)
-        db.commit()
-        return {**_model_json(model.id,result.spec,mesh,validation,model.generation_method,model.version,old.id,user=user),
-                'message':text,'provider':result.provider,'interpretation_provider':result.provider,
-                'geometry_generation_method':model.generation_method,'fallback_reason':result.fallback_reason}
-    except RuntimeError as exc: db.rollback(); raise HTTPException(503,detail={'message':str(exc)})
-    except (ValueError,UnsupportedGeometry) as exc: db.rollback(); raise HTTPException(422,detail={'message':str(exc)})
+        if old.generation_method==codegen.SCRIPT_METHOD:
+            if provider!='gemini':
+                raise HTTPException(422,detail={'message':'This model was created from a Gemini CadQuery script; refinements require the Gemini interpreter.'})
+            return _refine_script_model(db,user,conversation,old,payload,recent,request_id, cancel_entry, user_key)
+        else:
+            old_spec=Spec.model_validate(old.parameters_json)
+            if provider=='gemini':
+                return _refine_spec_through_gemini(db,user,conversation,old,payload,recent,old_spec,request_id, cancel_entry, user_key)
+            else:
+                try: result=interpret(payload.instruction,old_spec,recent,interpreter='local')
+                except (ParseError,UnsupportedGeometry,ValueError) as exc: cancellation_registry.fail(request_id); raise HTTPException(422,detail={'message':str(exc)})
+                if result.needs_clarification or result.spec is None: cancellation_registry.fail(request_id); raise HTTPException(422,detail={'message':result.clarifying_question or 'Please clarify the requested change.'})
+                try:
+                    model,mesh,validation,text=_create_model(db,user,result.spec,conversation,payload.instruction,result.provider,result.explanation,old,result.fallback_reason,payload.clearance_mm)
+                    new_components=[c.model_dump() if hasattr(c,'model_dump') else c for c in result.spec.components] if result.spec.shape_type=='assembly' else []
+                    db.commit()
+                    cancellation_registry.complete(request_id)
+                    return {**_model_json(model.id,result.spec,mesh,validation,model.generation_method,model.version,old.id,user=user,
+                                          change_summary=_build_change_summary(old, validation, new_components)),
+                            'message':text,'provider':result.provider,'interpretation_provider':result.provider,
+                            'geometry_generation_method':model.generation_method,'fallback_reason':result.fallback_reason,
+                            'request_id':request_id}
+                except RuntimeError as exc: cancellation_registry.fail(request_id); db.rollback(); raise HTTPException(503,detail={'message':str(exc)})
+                except (ValueError,UnsupportedGeometry) as exc: cancellation_registry.fail(request_id); db.rollback(); raise HTTPException(422,detail={'message':str(exc)})
+    except RuntimeError as exc: cancellation_registry.fail(request_id); db.rollback(); raise HTTPException(503,detail={'message':str(exc)})
+    except (ValueError,UnsupportedGeometry) as exc: cancellation_registry.fail(request_id); db.rollback(); raise HTTPException(422,detail={'message':str(exc)})
+    except codegen.CodegenError as exc: cancellation_registry.fail(request_id); raise _codegen_http_error(exc)
 
-def _refine_script_model(db,user,conversation,old,payload,recent):
+def _refine_script_model(db,user,conversation,old,payload,recent,request_id: str, cancel_entry: RequestCancellation, user_key: Optional[str] = None):
     script=(old.parameters_json or {}).get('creation_script','')
     plan=(old.parameters_json or {}).get('plan_dimensions_mm') or (old.validation_json or {}).get('requested_dimensions_mm')
-    if not script: raise HTTPException(422,detail={'message':'This model has no stored creation script to refine.'})
+    if not script: cancellation_registry.fail(request_id); raise HTTPException(422,detail={'message':'This model has no stored creation script to refine.'})
     request=codegen.ScriptRequest(prompt=payload.instruction,instruction=payload.instruction,previous_script=script,
                                   requested_dims=[float(axis) for axis in (plan or [80,80,100])],
                                   recent_context=recent)
     try:
-        generation=codegen.build_script(request)
+        call_kwargs = {'api_key': user_key} if user_key is not None else {}
+        generation=codegen.build_script(request, **call_kwargs)
+        if cancel_entry.is_cancelled():
+            cancellation_registry.cancel(request_id)
+            raise codegen.CodegenError('cancelled', 'Operation was cancelled.')
         model,mesh,validation,text=_persist_script_model(db,user,conversation,generation,'refinement',payload.instruction,old)
+        new_components=validation.get('components_detail', [])
         db.commit()
-        return {**_model_json(model.id,model.parameters_json,mesh,validation,model.generation_method,model.version,old.id,user=user),
+        cancellation_registry.complete(request_id)
+        return {**_model_json(model.id,model.parameters_json,mesh,validation,model.generation_method,model.version,old.id,user=user,
+                              change_summary=_build_change_summary(old, validation, new_components)),
                 'message':text,'provider':'gemini','interpretation_provider':'gemini',
                 'geometry_generation_method':codegen.SCRIPT_METHOD,'fallback_reason':None,
-                'script_attempts':generation.attempts}
-    except codegen.CodegenError as exc: db.rollback(); raise _codegen_http_error(exc)
-    except RuntimeError as exc: db.rollback(); raise HTTPException(503,detail={'message':str(exc)})
+                'script_attempts':generation.attempts,'request_id':request_id}
+    except codegen.CodegenError as exc: cancellation_registry.fail(request_id); db.rollback(); raise _codegen_http_error(exc)
+    except RuntimeError as exc: cancellation_registry.fail(request_id); db.rollback(); raise HTTPException(503,detail={'message':str(exc)})
 
-def _refine_spec_through_gemini(db,user,conversation,old,payload,recent,old_spec):
+def _refine_spec_through_gemini(db,user,conversation,old,payload,recent,old_spec,request_id: str, cancel_entry: RequestCancellation, user_key: Optional[str] = None):
     request=codegen.ScriptRequest(prompt=payload.instruction,instruction=payload.instruction,
                                   previous_spec=old.parameters_json,
                                   requested_dims=[old_spec.dimensions_mm.width,old_spec.dimensions_mm.depth,old_spec.dimensions_mm.height],
                                   previous_structure=[component.model_dump() for component in old_spec.components] if old_spec.shape_type=='assembly' else None,
                                   recent_context=recent)
     try:
-        generation=codegen.build_script(request)
+        call_kwargs = {'api_key': user_key} if user_key is not None else {}
+        generation=codegen.build_script(request, **call_kwargs)
+        if cancel_entry.is_cancelled():
+            cancellation_registry.cancel(request_id)
+            raise codegen.CodegenError('cancelled', 'Operation was cancelled.')
         model,mesh,validation,text=_persist_script_model(db,user,conversation,generation,'refinement',payload.instruction,old)
+        new_components=validation.get('components_detail', [])
         db.commit()
-        return {**_model_json(model.id,model.parameters_json,mesh,validation,model.generation_method,model.version,old.id,user=user),
+        cancellation_registry.complete(request_id)
+        return {**_model_json(model.id,model.parameters_json,mesh,validation,model.generation_method,model.version,old.id,user=user,
+                              change_summary=_build_change_summary(old, validation, new_components)),
                 'message':text,'provider':'gemini','interpretation_provider':'gemini',
                 'geometry_generation_method':codegen.SCRIPT_METHOD,'fallback_reason':None,
-                'script_attempts':generation.attempts}
-    except codegen.CodegenError as exc: db.rollback(); raise _codegen_http_error(exc)
-    except RuntimeError as exc: db.rollback(); raise HTTPException(503,detail={'message':str(exc)})
-    except (ValueError,UnsupportedGeometry) as exc: db.rollback(); raise HTTPException(422,detail={'message':str(exc)})
+                'script_attempts':generation.attempts,'request_id':request_id}
+    except codegen.CodegenError as exc: cancellation_registry.fail(request_id); db.rollback(); raise _codegen_http_error(exc)
+    except RuntimeError as exc: cancellation_registry.fail(request_id); db.rollback(); raise HTTPException(503,detail={'message':str(exc)})
+    except (ValueError,UnsupportedGeometry) as exc: cancellation_registry.fail(request_id); db.rollback(); raise HTTPException(422,detail={'message':str(exc)})
 
 @router.get('/models/{model_id}')
 def get_model(model_id: str,db: Session=Depends(get_db),user: User=Depends(current_user)):
@@ -605,10 +752,59 @@ def list_model_versions(conversation_id: str,limit: int=Query(50,ge=1,le=200),of
 def export_model(model_id: str,format: str,component: Optional[str]=Query(default=None),db: Session=Depends(get_db),user: User=Depends(current_user)):
     model=db.query(GeneratedModel).filter(GeneratedModel.id==model_id,GeneratedModel.owner_id==user.id).first()
     if not model: raise HTTPException(404,detail={'message':'Model not found.'})
-    if format not in ('stl','glb'): raise HTTPException(422,detail={'message':'Format must be stl or glb.'})
+    if format not in ('stl','glb','step'): raise HTTPException(422,detail={'message':'Format must be stl, glb, or step.'})
+    if format=='step':
+        folder=_artifact_folder(user,model)
+        if component:
+            safe_id=_slugify_component_id(component)
+            path=folder/f'step_{safe_id}.step'
+            if not path.is_file(): raise HTTPException(404,detail={'message':f'Component "{component}" STEP artifact not found.'})
+            data=path.read_bytes()
+            fname=f'modelforge-{component}.step'
+            return RawResponse(content=data,media_type='application/step',headers={'Content-Disposition':f'attachment; filename="{fname}"'})
+        path=folder/'model.step'
+        if not path.is_file(): raise HTTPException(410,detail={'message':'STEP artifact not found for this model.'})
+        data=path.read_bytes()
+        return RawResponse(content=data,media_type='application/step',headers={'Content-Disposition':'attachment; filename="modelforge.step"'})
     mesh=_load_mesh(user,model,component_id=component)
     try:
         data=mesh.export(file_type=format)
         fname=f'modelforge{("-"+component) if component else ""}.{format}'
         return RawResponse(content=data,media_type='model/stl' if format=='stl' else 'model/gltf-binary',headers={'Content-Disposition':f'attachment; filename="{fname}"'})
     except Exception as exc: raise HTTPException(422,detail={'message':'Export failed for this mesh.'}) from exc
+
+
+@router.post('/models/cancel')
+def cancel_generation(payload: CancelRequest,request: Request,db: Session=Depends(get_db),user: User=Depends(current_user),_:None=Depends(csrf_protected)):
+    """Request cancellation of a specific generation/refinement operation.
+
+    Only the owning user can cancel their own request. Idempotent: repeated
+    cancellation requests for the same request_id return the same result.
+    Unknown or already-terminal request IDs return 'unknown' status without
+    erroring, so callers cannot probe for another user's requests.
+    """
+    entry=cancellation_registry.request_cancellation(payload.request_id, user.id)
+    if entry is None:
+        # Request doesn't exist or isn't owned by this user; don't reveal which.
+        existing=cancellation_registry.get(payload.request_id)
+        if existing is not None and existing.user_id==user.id:
+            # Exists and owned but already terminal - report its final status
+            return CancelResponse(request_id=payload.request_id, cancelled=True, status=existing.status)
+        return CancelResponse(request_id=payload.request_id, cancelled=False, status='unknown')
+    # Cancellation requested: terminate the sandbox worker if one is active.
+    try:
+        sandbox_cancel_run(payload.request_id)
+    except Exception:
+        pass
+    return CancelResponse(request_id=payload.request_id, cancelled=True, status='cancellation_requested')
+
+
+@router.get('/models/cancel/{request_id}')
+def cancel_status(request_id: str,request: Request,db: Session=Depends(get_db),user: User=Depends(current_user),_:None=Depends(csrf_protected)):
+    """Check the cancellation status of a request. Ownership is enforced."""
+    entry=cancellation_registry.get(request_id)
+    if entry is None:
+        return CancelResponse(request_id=request_id, cancelled=False, status='unknown')
+    if entry.user_id != user.id:
+        return CancelResponse(request_id=request_id, cancelled=False, status='unknown')
+    return CancelResponse(request_id=request_id, cancelled=entry.is_cancelled(), status=entry.status)
